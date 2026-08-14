@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""Omaerofan — raw Gigabyte Aero fan + battery control."""
+
+from __future__ import annotations
+
+import curses
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HELPER = Path("/usr/local/libexec/omaerofan-ec")
+STATE_PATH = Path.home() / ".config/omaerofan/state.json"
+MODES = ("auto", "quiet", "gaming", "manual")
+MODE_LABELS = {
+    "auto": "AUTO",
+    "quiet": "QUIET",
+    "gaming": "GAMING",
+    "manual": "MANUAL",
+}
+
+
+def helper_cmd(*args: str) -> list[str]:
+    return ["sudo", "-n", str(HELPER), *args]
+
+
+def run_helper(*args: str) -> str:
+    if not HELPER.exists():
+        raise RuntimeError("helper missing — run: omaerofan install")
+    proc = subprocess.run(helper_cmd(*args), capture_output=True, text=True)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "helper failed").strip()
+        raise RuntimeError(err)
+    return proc.stdout
+
+
+def status() -> dict:
+    return json.loads(run_helper("status"))
+
+
+def save_state(data: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    prev = load_state() or {}
+    limit = data.get("battery_limit")
+    if not data.get("battery_on") and prev.get("battery_limit"):
+        limit = prev.get("battery_limit")
+    payload = {
+        "mode": data.get("mode"),
+        "fan0_pct": data.get("fan0_pct"),
+        "fan1_pct": data.get("fan1_pct"),
+        "battery_on": bool(data.get("battery_on")),
+        "battery_limit": limit,
+    }
+    STATE_PATH.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def load_state() -> dict | None:
+    if not STATE_PATH.exists():
+        return None
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+def clamp_fan(pct: int) -> int:
+    return max(0, min(100, pct))
+
+
+def step_fan(pct: int, delta: int) -> int:
+    return max(0, min(100, pct + delta))
+
+
+def clamp_batt(pct: int) -> int:
+    return max(20, min(100, pct))
+
+
+def sysfs_cpu_temp() -> int | None:
+    root = Path("/sys/class/hwmon")
+    if not root.exists():
+        return None
+    for hw in root.iterdir():
+        name = (hw / "name").read_text().strip() if (hw / "name").exists() else ""
+        if name != "coretemp":
+            continue
+        pkg = hw / "temp1_input"
+        if pkg.exists():
+            try:
+                return int(pkg.read_text()) // 1000
+            except ValueError:
+                return None
+    return None
+
+
+def nvidia_gpu_temp() -> int | None:
+    if not shutil.which("nvidia-smi"):
+        return None
+    proc = subprocess.run(
+        ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        return int(proc.stdout.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def enrich(data: dict) -> dict:
+    if not data.get("cpu_temp"):
+        cpu = sysfs_cpu_temp()
+        if cpu is not None:
+            data["cpu_temp"] = cpu
+            data["cpu_temp_src"] = "coretemp"
+    if not data.get("gpu_temp"):
+        gpu = nvidia_gpu_temp()
+        if gpu is not None:
+            data["gpu_temp"] = gpu
+            data["gpu_temp_src"] = "nvidia"
+    return data
+
+
+def print_status(data: dict) -> None:
+    data = enrich(data)
+    print(f"backend   {data.get('backend')}")
+    print(f"mode       {data.get('mode')}")
+    print(f"cpu        {data.get('cpu_temp')} C")
+    print(f"gpu        {data.get('gpu_temp')} C")
+    print(f"mlb        {data.get('mlb_temp')} C")
+    print(f"fan0       {data.get('fan0_rpm')} rpm   {data.get('fan0_pct')}%")
+    print(f"fan1       {data.get('fan1_rpm')} rpm   {data.get('fan1_pct')}%")
+    batt = "off" if not data.get("battery_on") else f"{data.get('battery_limit')}%"
+    print(f"battery    {batt}")
+
+
+def cmd_restore() -> int:
+    saved = load_state()
+    if not saved:
+        print("no saved state")
+        return 1
+    if saved.get("battery_on"):
+        run_helper("battery", str(clamp_batt(int(saved.get("battery_limit") or 60))))
+    else:
+        run_helper("battery", "off")
+    mode = saved.get("mode") or "auto"
+    if mode == "manual":
+        run_helper(
+            "fans",
+            str(clamp_fan(int(saved.get("fan0_pct") or 50))),
+            str(clamp_fan(int(saved.get("fan1_pct") or 50))),
+        )
+    else:
+        run_helper("mode", mode)
+    print_status(status())
+    return 0
+
+
+def source_dir() -> Path:
+    here = Path(__file__).resolve().parent
+    if (here / "omaerofan-ec.c").exists():
+        return here
+    return Path("/home/jan/Work/omaerofan")
+
+
+def install_user_launcher() -> Path:
+    dest = Path("/usr/local/bin/omaerofan")
+    if not dest.exists():
+        dest = Path.home() / ".local/bin/omaerofan"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.resolve() != Path(__file__).resolve():
+            shutil.copy2(Path(__file__).resolve(), dest)
+            dest.chmod(0o755)
+    apps = Path.home() / ".local/share/applications"
+    apps.mkdir(parents=True, exist_ok=True)
+    icon_src = source_dir() / "omaerofan.svg"
+    icon_dir = Path.home() / ".local/share/icons/hicolor/scalable/apps"
+    icon_dir.mkdir(parents=True, exist_ok=True)
+    if icon_src.exists():
+        shutil.copy2(icon_src, icon_dir / "omaerofan.svg")
+        subprocess.run(
+            ["gtk-update-icon-cache", str(Path.home() / ".local/share/icons/hicolor")],
+            capture_output=True,
+        )
+    desktop = apps / "Omaerofan.desktop"
+    desktop.write_text(
+        "\n".join(
+            [
+                "[Desktop Entry]",
+                "Version=1.0",
+                "Name=Omaerofan",
+                "GenericName=Fan Control",
+                "Comment=Raw Gigabyte Aero fan and battery control",
+                f"Exec=xdg-terminal-exec --app-id=org.omarchy.omaerofan -e {dest} ui",
+                "Terminal=false",
+                "Type=Application",
+                "Icon=omaerofan",
+                "Categories=System;Settings;HardwareSettings;",
+                "Keywords=fan;aero;gigabyte;battery;ec;",
+                "StartupNotify=true",
+                "",
+            ]
+        )
+    )
+    desktop.chmod(0o755)
+    return dest
+
+
+def install() -> int:
+    src = source_dir() / "omaerofan-ec.c"
+    if not src.exists():
+        print("cannot find omaerofan-ec.c", file=sys.stderr)
+        return 1
+    build = Path("/tmp/omaerofan-ec")
+    subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-o", str(build), str(src)], check=True)
+    root = source_dir() / "install-root.sh"
+    cli = source_dir() / "omaerofan"
+    subprocess.run(["pkexec", "bash", str(root), str(build), str(cli)], check=True)
+    dest = install_user_launcher()
+    print(f"installed. launch Omaerofan from SUPER+SPACE or run: {dest} ui")
+    return 0
+
+
+class Ui:
+    def __init__(self, stdscr: curses.window) -> None:
+        self.stdscr = stdscr
+        self.focus = 0  # 0 mode, 1 cpu, 2 gpu, 3 battery
+        self.err = ""
+        self.data: dict = {}
+        self.dump: str | None = None
+        curses.curs_set(0)
+        curses.use_default_colors()
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+        if curses.has_colors():
+            curses.start_color()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+            curses.init_pair(2, curses.COLOR_GREEN, -1)
+            curses.init_pair(3, curses.COLOR_YELLOW, -1)
+            curses.init_pair(4, curses.COLOR_RED, -1)
+            curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
+            curses.init_pair(6, curses.COLOR_WHITE, -1)
+
+    def refresh(self) -> None:
+        try:
+            self.data = enrich(status())
+            self.err = ""
+        except Exception as exc:  # noqa: BLE001
+            self.err = str(exc)
+
+    def apply(self, *args: str) -> None:
+        try:
+            self.data = enrich(json.loads(run_helper(*args)))
+            save_state(self.data)
+            self.err = ""
+        except Exception as exc:  # noqa: BLE001
+            self.err = str(exc)
+
+    def set_mode(self, mode: str) -> None:
+        self.apply("mode", mode)
+
+    def nudge_fan(self, which: str, delta: int) -> None:
+        cpu = int(self.data.get("fan0_pct") or 50)
+        gpu = int(self.data.get("fan1_pct") or 50)
+        if which == "cpu":
+            cpu = step_fan(cpu, delta)
+        else:
+            gpu = step_fan(gpu, delta)
+        self.apply("fans", str(cpu), str(gpu))
+
+    def nudge_batt(self, delta: int) -> None:
+        if not self.data.get("battery_on"):
+            self.apply("battery", str(clamp_batt(int(self.data.get("battery_limit") or 60))))
+            return
+        self.apply("battery", str(clamp_batt(int(self.data.get("battery_limit") or 60) + delta)))
+
+    def toggle_batt(self) -> None:
+        if self.data.get("battery_on"):
+            self.apply("battery", "off")
+        else:
+            self.apply("battery", str(clamp_batt(int(self.data.get("battery_limit") or 60))))
+
+    def draw_bar(self, y: int, x: int, width: int, pct: int, selected: bool) -> None:
+        width = max(10, width)
+        fill = 0 if pct <= 0 else max(1, int(round(width * pct / 100)))
+        bar = "█" * fill + "─" * (width - fill)
+        attr = curses.A_BOLD if selected else curses.A_NORMAL
+        if curses.has_colors() and selected:
+            attr |= curses.color_pair(1)
+        self.add(y, x, f"[{bar}] {pct:3d}%", attr)
+
+    def add(self, y: int, x: int, text: str, attr: int = 0) -> None:
+        h, w = self.stdscr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        self.stdscr.addnstr(y, x, text, max(0, w - x - 1), attr)
+
+    def temp_attr(self, temp: int) -> int:
+        if not curses.has_colors():
+            return curses.A_BOLD
+        if temp >= 85:
+            return curses.color_pair(4) | curses.A_BOLD
+        if temp >= 75:
+            return curses.color_pair(3) | curses.A_BOLD
+        return curses.color_pair(2) | curses.A_BOLD
+
+    def draw(self) -> None:
+        self.stdscr.erase()
+        h, w = self.stdscr.getmaxyx()
+        d = self.data
+        title_attr = curses.color_pair(1) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+        self.add(1, 2, "OMAEROFAN", title_attr)
+        self.add(1, 13, "Gigabyte AERO 17 XB", curses.A_DIM)
+
+        if self.dump is not None:
+            for i, line in enumerate(self.dump.splitlines()[: h - 4]):
+                self.add(3 + i, 2, line)
+            self.add(h - 2, 2, "d dump   q quit", curses.A_DIM)
+            self.stdscr.refresh()
+            return
+
+        cpu = int(d.get("cpu_temp") or 0)
+        gpu = int(d.get("gpu_temp") or 0)
+        mlb = int(d.get("mlb_temp") or 0)
+        self.add(3, 2, "CPU", curses.A_DIM)
+        self.add(3, 6, f"{cpu:3d}°", self.temp_attr(cpu))
+        self.add(3, 14, "GPU", curses.A_DIM)
+        self.add(3, 18, f"{gpu:3d}°", self.temp_attr(gpu))
+        self.add(3, 26, "MLB", curses.A_DIM)
+        self.add(3, 30, f"{mlb:3d}°", self.temp_attr(mlb))
+        self.add(4, 2, f"FAN0 {int(d.get('fan0_rpm') or 0):4d} rpm", curses.A_NORMAL)
+        self.add(4, 20, f"FAN1 {int(d.get('fan1_rpm') or 0):4d} rpm", curses.A_NORMAL)
+
+        mode = d.get("mode") or "auto"
+        self.add(6, 2, "MODE", curses.A_DIM)
+        x = 2
+        for i, name in enumerate(MODES):
+            label = f" {MODE_LABELS[name]} "
+            selected_mode = name == mode
+            focused = self.focus == 0
+            if selected_mode and curses.has_colors():
+                attr = curses.color_pair(5) | curses.A_BOLD
+            elif selected_mode:
+                attr = curses.A_REVERSE | curses.A_BOLD
+            elif focused:
+                attr = curses.A_BOLD
+            else:
+                attr = curses.A_DIM
+            self.add(7, x, label, attr)
+            x += len(label) + 1
+
+        bar_w = max(12, min(36, w - 22))
+        cpu_sel = self.focus == 1
+        gpu_sel = self.focus == 2
+        self.add(9, 2, "CPU FAN", curses.A_BOLD if cpu_sel else curses.A_DIM)
+        self.draw_bar(9, 12, bar_w, int(d.get("fan0_pct") or 0), cpu_sel)
+        self.add(10, 2, "GPU FAN", curses.A_BOLD if gpu_sel else curses.A_DIM)
+        self.draw_bar(10, 12, bar_w, int(d.get("fan1_pct") or 0), gpu_sel)
+
+        batt_sel = self.focus == 3
+        batt_on = bool(d.get("battery_on"))
+        batt_pct = int(d.get("battery_limit") or 0)
+        self.add(12, 2, "BATTERY", curses.A_BOLD if batt_sel else curses.A_DIM)
+        on_attr = curses.A_REVERSE | curses.A_BOLD if batt_on else curses.A_DIM
+        off_attr = curses.A_REVERSE | curses.A_BOLD if not batt_on else curses.A_DIM
+        if batt_sel and curses.has_colors() and batt_on:
+            on_attr = curses.color_pair(5) | curses.A_BOLD
+        if batt_sel and curses.has_colors() and not batt_on:
+            off_attr = curses.color_pair(5) | curses.A_BOLD
+        self.add(12, 12, " ON ", on_attr)
+        self.add(12, 17, " OFF ", off_attr)
+        if batt_on:
+            self.draw_bar(12, 24, max(10, bar_w - 12), batt_pct, batt_sel)
+
+        if self.err:
+            self.add(14, 2, self.err, curses.color_pair(4) if curses.has_colors() else curses.A_BOLD)
+        backend = d.get("backend") or "?"
+        self.add(h - 2, 2, f"1-4 mode   j/k select   h/l adjust   b battery   d dump   q quit   {backend}", curses.A_DIM)
+        self.stdscr.refresh()
+
+    def cycle_mode(self, delta: int) -> None:
+        cur = self.data.get("mode") or "auto"
+        idx = MODES.index(cur) if cur in MODES else 0
+        self.set_mode(MODES[(idx + delta) % len(MODES)])
+
+    def handle(self, key: int) -> bool:
+        if key in (ord("q"), 27):
+            return False
+        if key in (ord("d"),):
+            if self.dump is None:
+                try:
+                    self.dump = run_helper("dump")
+                    self.err = ""
+                except Exception as exc:  # noqa: BLE001
+                    self.err = str(exc)
+            else:
+                self.dump = None
+            return True
+        if self.dump is not None:
+            return True
+        if key in (ord("1"),):
+            self.set_mode("auto")
+        elif key in (ord("2"),):
+            self.set_mode("quiet")
+        elif key in (ord("3"),):
+            self.set_mode("gaming")
+        elif key in (ord("4"),):
+            self.set_mode("manual")
+        elif key in (ord("b"),):
+            self.toggle_batt()
+        elif key in (curses.KEY_DOWN, ord("j"), 9):
+            self.focus = (self.focus + 1) % 4
+        elif key in (curses.KEY_UP, ord("k"), curses.KEY_BTAB):
+            self.focus = (self.focus - 1) % 4
+        elif key in (curses.KEY_LEFT, ord("h")):
+            if self.focus == 0:
+                self.cycle_mode(-1)
+            elif self.focus == 1:
+                self.nudge_fan("cpu", -5)
+            elif self.focus == 2:
+                self.nudge_fan("gpu", -5)
+            else:
+                self.nudge_batt(-5)
+        elif key in (curses.KEY_RIGHT, ord("l")):
+            if self.focus == 0:
+                self.cycle_mode(1)
+            elif self.focus == 1:
+                self.nudge_fan("cpu", 5)
+            elif self.focus == 2:
+                self.nudge_fan("gpu", 5)
+            else:
+                self.nudge_batt(5)
+        elif key in (ord("-"),):
+            if self.focus in (1, 2):
+                self.nudge_fan("cpu" if self.focus == 1 else "gpu", -5)
+            else:
+                self.nudge_batt(-5)
+        elif key in (ord("+"), ord("=")):
+            if self.focus in (1, 2):
+                self.nudge_fan("cpu" if self.focus == 1 else "gpu", 5)
+            else:
+                self.nudge_batt(5)
+        elif key in (ord("r"),):
+            self.refresh()
+        return True
+
+    def loop(self) -> None:
+        self.refresh()
+        last = 0.0
+        while True:
+            now = time.monotonic()
+            if now - last > 1.0 and self.dump is None:
+                self.refresh()
+                last = now
+            self.draw()
+            try:
+                key = self.stdscr.getch()
+            except curses.error:
+                key = -1
+            if key == -1:
+                time.sleep(0.05)
+                continue
+            if not self.handle(key):
+                return
+
+
+def usage() -> None:
+    print(
+        """omaerofan — raw Gigabyte AERO 17 XB fan + battery control
+
+  omaerofan                 status
+  omaerofan ui              TUI
+  omaerofan auto|quiet|gaming
+  omaerofan cpu <pct>       manual CPU fan  (0-100)
+  omaerofan gpu <pct>       manual GPU fan
+  omaerofan fans <pct> [gpu-pct]
+  omaerofan battery         show limit
+  omaerofan battery off
+  omaerofan battery <pct>   20-100
+  omaerofan dump            raw EC bytes
+  omaerofan restore         last saved settings
+  omaerofan install         helper + launcher
+"""
+    )
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("status", "show"):
+        try:
+            print_status(status())
+        except Exception as exc:  # noqa: BLE001
+            print(exc, file=sys.stderr)
+            return 1
+        return 0
+    cmd = argv[0]
+    try:
+        if cmd in ("ui", "tui"):
+            curses.wrapper(lambda stdscr: Ui(stdscr).loop())
+            return 0
+        if cmd in MODES:
+            data = json.loads(run_helper("mode", cmd))
+            save_state(data)
+            print_status(data)
+            return 0
+        if cmd == "cpu" and len(argv) == 2:
+            st = status()
+            data = json.loads(run_helper("fans", str(clamp_fan(int(argv[1]))), str(st.get("fan1_pct") or 50)))
+            save_state(data)
+            print_status(data)
+            return 0
+        if cmd == "gpu" and len(argv) == 2:
+            st = status()
+            data = json.loads(run_helper("fans", str(st.get("fan0_pct") or 50), str(clamp_fan(int(argv[1])))))
+            save_state(data)
+            print_status(data)
+            return 0
+        if cmd == "fans" and len(argv) in (2, 3):
+            cpu = clamp_fan(int(argv[1]))
+            gpu = clamp_fan(int(argv[2])) if len(argv) == 3 else cpu
+            data = json.loads(run_helper("fans", str(cpu), str(gpu)))
+            save_state(data)
+            print_status(data)
+            return 0
+        if cmd == "battery":
+            if len(argv) == 1:
+                st = status()
+                print("off" if not st.get("battery_on") else f"{st.get('battery_limit')}%")
+                return 0
+            if argv[1] == "off":
+                data = json.loads(run_helper("battery", "off"))
+            else:
+                data = json.loads(run_helper("battery", str(clamp_batt(int(argv[1])))))
+            save_state(data)
+            print_status(data)
+            return 0
+        if cmd == "dump":
+            print(run_helper("dump"), end="")
+            return 0
+        if cmd == "restore":
+            return cmd_restore()
+        if cmd == "install":
+            return install()
+        if cmd in ("-h", "--help", "help"):
+            usage()
+            return 0
+    except Exception as exc:  # noqa: BLE001
+        print(exc, file=sys.stderr)
+        return 1
+    usage()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
