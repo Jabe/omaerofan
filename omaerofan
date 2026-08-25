@@ -197,67 +197,6 @@ def source_dir() -> Path:
     )
 
 
-def install_user_launcher() -> Path:
-    dest = Path("/usr/local/bin/omaerofan")
-    if not dest.exists():
-        dest = Path.home() / ".local/bin/omaerofan"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.resolve() != Path(__file__).resolve():
-            shutil.copy2(Path(__file__).resolve(), dest)
-            dest.chmod(0o755)
-    apps = Path.home() / ".local/share/applications"
-    apps.mkdir(parents=True, exist_ok=True)
-    icon_src = source_dir() / "omaerofan.svg"
-    icon_dir = Path.home() / ".local/share/icons/hicolor/scalable/apps"
-    icon_dir.mkdir(parents=True, exist_ok=True)
-    if icon_src.exists():
-        shutil.copy2(icon_src, icon_dir / "omaerofan.svg")
-        subprocess.run(
-            ["gtk-update-icon-cache", str(Path.home() / ".local/share/icons/hicolor")],
-            capture_output=True,
-        )
-    desktop = apps / "Omaerofan.desktop"
-    desktop.write_text(
-        "\n".join(
-            [
-                "[Desktop Entry]",
-                "Version=1.0",
-                "Name=Omaerofan",
-                "GenericName=Fan Control",
-                "Comment=Raw Gigabyte Aero fan and battery control",
-                f"Exec=xdg-terminal-exec --app-id=org.omarchy.omaerofan -e {dest} ui",
-                "Terminal=false",
-                "Type=Application",
-                "Icon=omaerofan",
-                "Categories=System;Settings;HardwareSettings;",
-                "Keywords=fan;aero;gigabyte;battery;ec;",
-                "StartupNotify=true",
-                "",
-            ]
-        )
-    )
-    desktop.chmod(0o755)
-    install_user_resume_hook()
-    return dest
-
-
-def install_user_resume_hook() -> None:
-    # EC firmware resets fans/charge limit on S3; restore last saved state.
-    unit_dir = Path.home() / ".config/systemd/user"
-    unit_dir.mkdir(parents=True, exist_ok=True)
-    src = source_dir()
-    script = unit_dir / "omaerofan-resume.sh"
-    shutil.copy2(src / "omaerofan-resume.sh", script)
-    script.chmod(0o755)
-    shutil.copy2(src / "omaerofan-resume.service", unit_dir / "omaerofan-resume.service")
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, capture_output=True)
-    subprocess.run(
-        ["systemctl", "--user", "enable", "--now", "omaerofan-resume.service"],
-        check=False,
-        capture_output=True,
-    )
-
-
 def install() -> int:
     src = source_dir() / "omaerofan-ec.c"
     if not src.exists():
@@ -268,8 +207,7 @@ def install() -> int:
     root = source_dir() / "install-root.sh"
     cli = source_dir() / "omaerofan"
     subprocess.run(["pkexec", "bash", str(root), str(build), str(cli)], check=True)
-    dest = install_user_launcher()
-    print(f"installed helper. use the Omaerofan bar widget, or: {dest} ui")
+    print("installed helper. use the Omaerofan bar widget, or: omaerofan ui")
     return 0
 
 
@@ -532,7 +470,7 @@ def usage() -> None:
   omaerofan battery <pct>   20-100
   omaerofan dump            raw EC bytes
   omaerofan restore         last saved settings
-  omaerofan install         helper + launcher + resume hook
+  omaerofan install         privileged EC helper
 """
     )
 

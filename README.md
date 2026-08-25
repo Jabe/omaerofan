@@ -10,7 +10,7 @@ Talks to the embedded controller through the in-tree `ec_sys` interface. No nbfc
 omarchy plugin add https://github.com/Jabe/omaerofan.git --enable
 ```
 
-That clones the plugin into `~/.config/omarchy/plugins/jabe.omaerofan/` and puts **Omaerofan** on the bar. Open the panel and click **Install helper** once (`gcc` + `pkexec`). That compiles the EC helper, installs a passwordless `sudo` rule for that binary only, loads `ec_sys` with write support, and enables the resume restore hook.
+That clones the plugin into `~/.config/omarchy/plugins/jabe.omaerofan/` and puts **Omaerofan** on the bar. Open the panel and click **Install helper** once (`gcc` + `pkexec`). That compiles the EC helper, installs a passwordless `sudo` rule for that binary only, and loads `ec_sys` with write support. After suspend the plugin restores the last saved fan and charge-limit settings.
 
 From a local checkout:
 
