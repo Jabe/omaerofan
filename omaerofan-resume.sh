@@ -2,6 +2,8 @@
 # Gigabyte EC firmware resets fan mode and charge limit on S3. Re-apply the
 # last saved settings once the controller is writable again.
 
+export PATH="$HOME/.config/omarchy/plugins/jabe.omaerofan:/usr/local/bin:$HOME/.local/bin:$PATH"
+
 restore() {
   # Firmware often writes its own defaults for a beat after resume.
   sleep 1

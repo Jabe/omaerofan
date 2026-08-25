@@ -8,7 +8,7 @@ Type=simple
 ExecStart=%h/.config/systemd/user/omaerofan-resume.sh
 Restart=always
 RestartSec=2
-Environment=PATH=/usr/local/bin:%h/.local/bin:/usr/bin
+Environment=PATH=%h/.config/omarchy/plugins/jabe.omaerofan:/usr/local/bin:%h/.local/bin:/usr/bin
 
 [Install]
 WantedBy=default.target

@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 HELPER = Path("/usr/local/libexec/omaerofan-ec")
+PLUGIN_ID = "jabe.omaerofan"
 STATE_PATH = Path.home() / ".config/omaerofan/state.json"
 MODES = ("auto", "quiet", "gaming", "manual")
 MODE_LABELS = {
@@ -138,6 +139,31 @@ def print_status(data: dict) -> None:
     print(f"battery    {batt}")
 
 
+def emit_json(payload: dict) -> None:
+    print(json.dumps(payload, ensure_ascii=True))
+
+
+def cmd_json() -> int:
+    if not HELPER.exists():
+        emit_json(
+            {
+                "ok": False,
+                "installed": False,
+                "error": "helper missing — install from the Omaerofan panel",
+            }
+        )
+        return 0
+    try:
+        data = enrich(status())
+        data["ok"] = True
+        data["installed"] = True
+        emit_json(data)
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        emit_json({"ok": False, "installed": HELPER.exists(), "error": str(exc)})
+        return 1
+
+
 def cmd_restore() -> int:
     saved = load_state()
     if not saved:
@@ -162,9 +188,13 @@ def cmd_restore() -> int:
 
 def source_dir() -> Path:
     here = Path(__file__).resolve().parent
-    if (here / "omaerofan-ec.c").exists():
-        return here
-    return Path("/home/jan/Work/omaerofan")
+    plugin = Path.home() / ".config/omarchy/plugins" / PLUGIN_ID
+    for candidate in (here, plugin):
+        if (candidate / "omaerofan-ec.c").exists():
+            return candidate
+    raise RuntimeError(
+        f"cannot find omaerofan-ec.c next to {here} or in {plugin}"
+    )
 
 
 def install_user_launcher() -> Path:
@@ -239,7 +269,7 @@ def install() -> int:
     cli = source_dir() / "omaerofan"
     subprocess.run(["pkexec", "bash", str(root), str(build), str(cli)], check=True)
     dest = install_user_launcher()
-    print(f"installed. launch Omaerofan from SUPER+SPACE or run: {dest} ui")
+    print(f"installed helper. use the Omaerofan bar widget, or: {dest} ui")
     return 0
 
 
@@ -491,8 +521,9 @@ def usage() -> None:
         """omaerofan — raw Gigabyte AERO 17 XB fan + battery control
 
   omaerofan                 status
+  omaerofan json            JSON status (Omarchy plugin)
   omaerofan ui              TUI
-  omaerofan auto|quiet|gaming
+  omaerofan auto|quiet|gaming|manual
   omaerofan cpu <pct>       manual CPU fan  (0-100)
   omaerofan gpu <pct>       manual GPU fan
   omaerofan fans <pct> [gpu-pct]
@@ -501,7 +532,7 @@ def usage() -> None:
   omaerofan battery <pct>   20-100
   omaerofan dump            raw EC bytes
   omaerofan restore         last saved settings
-  omaerofan install         helper + launcher
+  omaerofan install         helper + launcher + resume hook
 """
     )
 
@@ -555,6 +586,8 @@ def main(argv: list[str]) -> int:
             save_state(data)
             print_status(data)
             return 0
+        if cmd in ("json", "--json"):
+            return cmd_json()
         if cmd == "dump":
             print(run_helper("dump"), end="")
             return 0

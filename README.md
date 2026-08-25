@@ -1,25 +1,39 @@
 # Omaerofan
 
-Raw fan and battery-limit control for the **Gigabyte AERO 17 XB**.
+Omarchy bar plugin for raw fan and charge-limit control on the **Gigabyte AERO 17 XB**.
 
 Talks to the embedded controller through the in-tree `ec_sys` interface. No nbfc, no `ec_probe`.
 
-Built as a small Omarchy TUI (`Omaerofan` in the app launcher) plus a CLI.
-
 ## Install
 
-Needs `gcc`, `sudo`, and `pkexec` once:
-
 ```bash
-./omaerofan install
+omarchy plugin add https://github.com/Jabe/omaerofan.git --enable
 ```
 
-That compiles the helper, installs it to `/usr/local/libexec/omaerofan-ec`, adds a passwordless `sudo` rule for that binary only, loads `ec_sys` with write support, and creates the desktop launcher.
+That clones the plugin into `~/.config/omarchy/plugins/jabe.omaerofan/` and puts **Omaerofan** on the bar. Open the panel and click **Install helper** once (`gcc` + `pkexec`). That compiles the EC helper, installs a passwordless `sudo` rule for that binary only, loads `ec_sys` with write support, and enables the resume restore hook.
+
+From a local checkout:
+
+```bash
+omarchy plugin add /path/to/omaerofan --enable
+omarchy plugin validate /path/to/omaerofan
+```
+
+The helper install can also be run from a terminal:
+
+```bash
+~/.config/omarchy/plugins/jabe.omaerofan/omaerofan install
+```
 
 ## Usage
 
+Click the bar chip (fan icon + CPU temp) for modes, per-fan sliders, and the charge limit.
+
+The plugin restores the last saved settings after suspend. The CLI still works for scripts and a fallback TUI:
+
 ```bash
 omaerofan                 # status
+omaerofan json            # JSON status
 omaerofan ui              # TUI
 omaerofan auto|quiet|gaming
 omaerofan fans 40         # both fans, 0-100
@@ -30,8 +44,6 @@ omaerofan battery off
 omaerofan dump            # raw EC bytes
 omaerofan restore         # last saved settings
 ```
-
-The embedded controller resets fans and the charge limit on suspend. `install` enables a user service that runs `omaerofan restore` after resume.
 
 TUI keys: `1-4` modes, `j/k` select, `h/l` adjust, `b` battery, `d` dump, `q` quit.
 
