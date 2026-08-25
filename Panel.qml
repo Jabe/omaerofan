@@ -53,7 +53,6 @@ Panel {
     return ["mode", "cpu", "gpu", "battery"]
   }
   readonly property color dim: Qt.darker(barForeground, 1.4)
-  readonly property string barLabel: Model.barLabel(status)
   readonly property string heroStatusText: {
     if (!installed) return "HELPER MISSING"
     if (lastError) return "ERROR"
@@ -217,8 +216,11 @@ Panel {
     }
   }
 
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
+  implicitWidth: Style.bar.iconSlot
+  implicitHeight: Style.bar.sizeHorizontal
+  width: Style.bar.iconSlot
+  height: Style.bar.sizeHorizontal
+  clip: true
 
   Component.onCompleted: refresh()
 
@@ -285,8 +287,8 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.barLabel
-    slotSize: Style.bar.statusSlot
+    text: Model.fanIcon(root.mode)
+    slotSize: Style.bar.iconSlot
     active: root.hot
     tooltipText: ""
     onPressed: function(b) { root.toggle() }

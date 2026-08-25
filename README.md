@@ -27,7 +27,7 @@ The helper install can also be run from a terminal:
 
 ## Usage
 
-Click the bar chip (fan icon + CPU temp) for modes, per-fan sliders, and the charge limit.
+Click the fan icon on the bar for modes, per-fan sliders, and the charge limit.
 
 The plugin restores the last saved settings after suspend. The CLI still works for scripts and a fallback TUI:
 

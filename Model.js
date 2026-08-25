@@ -53,13 +53,6 @@ function hottestTemp(data) {
   return Math.max(cpu, gpu, mlb)
 }
 
-function barLabel(data) {
-  if (!data || data.ok === false || !data.installed) return fanIcon("")
-  var temp = num(data.cpu_temp, 0)
-  if (temp <= 0) return fanIcon(data.mode)
-  return fanIcon(data.mode) + " " + Math.round(temp) + "°"
-}
-
 function tempTone(temp) {
   var t = num(temp, 0)
   if (t >= 85) return "hot"
@@ -78,7 +71,6 @@ if (typeof module !== "undefined") {
     modeStatus: modeStatus,
     fanIcon: fanIcon,
     hottestTemp: hottestTemp,
-    barLabel: barLabel,
     tempTone: tempTone
   }
 }
