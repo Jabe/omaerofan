@@ -31,6 +31,8 @@ omaerofan dump            # raw EC bytes
 omaerofan restore         # last saved settings
 ```
 
+The embedded controller resets fans and the charge limit on suspend. `install` enables a user service that runs `omaerofan restore` after resume.
+
 TUI keys: `1-4` modes, `j/k` select, `h/l` adjust, `b` battery, `d` dump, `q` quit.
 
 ## Hardware

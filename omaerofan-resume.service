@@ -1,0 +1,14 @@
+[Unit]
+Description=Restore omaerofan fan and battery settings after sleep
+After=dbus.socket
+Requires=dbus.socket
+
+[Service]
+Type=simple
+ExecStart=%h/.config/systemd/user/omaerofan-resume.sh
+Restart=always
+RestartSec=2
+Environment=PATH=/usr/local/bin:%h/.local/bin:/usr/bin
+
+[Install]
+WantedBy=default.target

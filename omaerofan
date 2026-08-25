@@ -207,7 +207,25 @@ def install_user_launcher() -> Path:
         )
     )
     desktop.chmod(0o755)
+    install_user_resume_hook()
     return dest
+
+
+def install_user_resume_hook() -> None:
+    # EC firmware resets fans/charge limit on S3; restore last saved state.
+    unit_dir = Path.home() / ".config/systemd/user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    src = source_dir()
+    script = unit_dir / "omaerofan-resume.sh"
+    shutil.copy2(src / "omaerofan-resume.sh", script)
+    script.chmod(0o755)
+    shutil.copy2(src / "omaerofan-resume.service", unit_dir / "omaerofan-resume.service")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, capture_output=True)
+    subprocess.run(
+        ["systemctl", "--user", "enable", "--now", "omaerofan-resume.service"],
+        check=False,
+        capture_output=True,
+    )
 
 
 def install() -> int:
