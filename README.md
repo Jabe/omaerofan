@@ -4,7 +4,7 @@ Omarchy bar plugin for raw fan, RAPL, and charge-limit control on the **Gigabyte
 
 Talks to the embedded controller through the in-tree `ec_sys` interface. No nbfc, no `ec_probe`.
 
-Fan mode stays independent. **RAPL follows the Omarchy power profile** (`power-saver` / `balanced` / `performance`) so Quiet/Manual 15% is no longer the only way to keep the chassis cool. Leave fans on **Auto** and let the EC curve match the watt budget.
+Fan mode stays independent. **RAPL follows the Omarchy power profile**. EC Auto floors around 30% / 2900 RPM — use **Curve** for a quieter software map on manual duty.
 
 ## Install
 
@@ -37,7 +37,9 @@ The plugin restores the last saved settings after suspend. The CLI still works f
 omaerofan                 # status
 omaerofan json            # JSON status
 omaerofan ui              # TUI
-omaerofan auto|quiet|gaming
+omaerofan auto|quiet|gaming|manual|curve
+omaerofan apply-curve
+omaerofan curve-min 12
 omaerofan fans 40         # both fans, 0-100
 omaerofan cpu 25
 omaerofan gpu 40
@@ -49,7 +51,11 @@ omaerofan dump            # raw EC bytes
 omaerofan restore         # last saved fan/battery settings + RAPL sync
 ```
 
-TUI keys: `1-4` modes, `j/k` select, `h/l` adjust, `b` battery, `d` dump, `q` quit.
+TUI keys: `1-5` modes, `j/k` select, `h/l` adjust, `b` battery, `d` dump, `q` quit.
+
+## Fan curve
+
+`curve` writes a software duty map (not the EC auto curve). Default floor is 12%. Points live in `~/.config/omaerofan/curve.json`. The shell plugin reapplies it every 1.5s and after resume. Dragging the manual sliders leaves curve and goes back to Manual.
 
 ## Hardware
 
@@ -76,6 +82,8 @@ Manual fan duty is 0–100%. `0` stops the fans. Watch temperatures.
 | `performance` | 45 W | 135 W |
 
 That file is created on first sync. Set `"follow_power_profile": false` to stop. Fans are not changed.
+
+Quiet mode is a separate EC brake: it does **not** change RAPL or HWP. The EC asserts **EDP** (`MSR 0x64F`), which clips turbo — measured ~2.2 GHz vs 5.3 GHz. The panel/CLI `brake` line shows that.
 
 Writing the wrong EC register can brick a laptop. The helper only allows known fan and charge registers, plus RAPL sysfs.
 

@@ -54,6 +54,15 @@ static const char *RAPL_PL1_MAX_PATH =
     "/sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw";
 static const char *RAPL_PL2_MAX_PATH =
     "/sys/class/powercap/intel-rapl:0/constraint_1_max_power_uw";
+static const char *MSR_PATH = "/dev/cpu/0/msr";
+
+#define MSR_PERF_STATUS 0x198
+#define MSR_THERM_STATUS 0x19C
+#define MSR_TURBO_RATIO_LIMIT 0x1AD
+#define MSR_RAPL_POWER_UNIT 0x606
+#define MSR_PKG_POWER_LIMIT 0x610
+#define MSR_CORE_PERF_LIMIT 0x64F
+#define MSR_HWP_REQUEST 0x774
 
 enum backend { BACKEND_NONE, BACKEND_SYSFS, BACKEND_DEV, BACKEND_PORT };
 
@@ -366,6 +375,109 @@ static void apply_rapl(int pl1_w, int pl2_w) {
     die_errno("RAPL PL1 write failed");
 }
 
+static int msr_fd = -1;
+
+static int open_msr(void) {
+  if (msr_fd >= 0)
+    return 0;
+  msr_fd = open(MSR_PATH, O_RDONLY);
+  if (msr_fd >= 0)
+    return 0;
+  if (system("modprobe msr >/dev/null 2>&1") != 0)
+    return -1;
+  msr_fd = open(MSR_PATH, O_RDONLY);
+  return msr_fd >= 0 ? 0 : -1;
+}
+
+static int rdmsr(uint32_t addr, uint64_t *val) {
+  if (open_msr() < 0)
+    return -1;
+  if (pread(msr_fd, val, 8, addr) != 8)
+    return -1;
+  return 0;
+}
+
+static int rapl_unit_div(void) {
+  uint64_t units = 0;
+  if (rdmsr(MSR_RAPL_POWER_UNIT, &units) < 0)
+    return 8;
+  int exp = (int)(units & 0xF);
+  if (exp <= 0 || exp > 15)
+    return 8;
+  return 1 << exp;
+}
+
+static int msr_pl_watts(uint64_t raw, int shift) {
+  int div = rapl_unit_div();
+  unsigned v = (unsigned)((raw >> shift) & 0x7FFFu);
+  return (int)((v + (unsigned)div / 2u) / (unsigned)div);
+}
+
+static void print_json_brakes(uint64_t reasons) {
+  static const char *names[16] = {
+      "prochot",   "thermal",    NULL,         NULL,        "graphics",
+      "autonomous","vr-therm",   "vr-tdc",     "edp",       "pl1",
+      "pl2",       "max-turbo",  "turbo-atten","max-eff",   NULL,
+      NULL};
+  printf("  \"brakes\": [");
+  int first = 1;
+  unsigned st = (unsigned)(reasons & 0xFFFFu);
+  for (int i = 0; i < 16; i++) {
+    if (!names[i] || !(st & (1u << i)))
+      continue;
+    if (!first)
+      printf(", ");
+    first = 0;
+    printf("\"%s\"", names[i]);
+  }
+  printf("],\n");
+}
+
+static void print_msr_fields(void) {
+  uint64_t v = 0;
+  if (rdmsr(MSR_CORE_PERF_LIMIT, &v) == 0) {
+    print_json_brakes(v);
+    printf("  \"perf_limit\": \"0x%llx\",\n", (unsigned long long)v);
+  } else {
+    printf("  \"brakes\": [],\n");
+    printf("  \"perf_limit\": null,\n");
+  }
+
+  if (rdmsr(MSR_PKG_POWER_LIMIT, &v) == 0) {
+    printf("  \"msr_pl1_w\": %d,\n", msr_pl_watts(v, 0));
+    printf("  \"msr_pl2_w\": %d,\n", msr_pl_watts(v, 32));
+  } else {
+    printf("  \"msr_pl1_w\": -1,\n");
+    printf("  \"msr_pl2_w\": -1,\n");
+  }
+
+  if (rdmsr(MSR_HWP_REQUEST, &v) == 0) {
+    printf("  \"hwp_min_mhz\": %d,\n", (int)(v & 0xFF) * 100);
+    printf("  \"hwp_max_mhz\": %d,\n", (int)((v >> 8) & 0xFF) * 100);
+  } else {
+    printf("  \"hwp_min_mhz\": -1,\n");
+    printf("  \"hwp_max_mhz\": -1,\n");
+  }
+
+  if (rdmsr(MSR_TURBO_RATIO_LIMIT, &v) == 0)
+    printf("  \"turbo_mhz\": %d,\n", (int)(v & 0xFF) * 100);
+  else
+    printf("  \"turbo_mhz\": -1,\n");
+
+  if (rdmsr(MSR_THERM_STATUS, &v) == 0) {
+    printf("  \"therm_prochot\": %d,\n", (int)((v >> 2) & 1u));
+    printf("  \"therm_pl\": %d,\n", (int)((v >> 10) & 1u));
+  } else {
+    printf("  \"therm_prochot\": 0,\n");
+    printf("  \"therm_pl\": 0,\n");
+  }
+
+  if (rdmsr(MSR_PERF_STATUS, &v) == 0)
+    printf("  \"perf_mhz\": %d,\n", (int)((v >> 8) & 0xFF) * 100);
+  else
+    printf("  \"perf_mhz\": -1,\n");
+}
+
 static void apply_battery(int on, int pct) {
   if (on) {
     if (pct < 20 || pct > 100)
@@ -405,7 +517,9 @@ static void print_status(void) {
   printf("  \"battery_on\": %d,\n", batt_on);
   printf("  \"battery_limit\": %u,\n", must_read(REG_CHARGE_PCT));
   printf("  \"pl1_w\": %d,\n", rapl_watts(RAPL_PL1_PATH));
-  printf("  \"pl2_w\": %d\n", rapl_watts(RAPL_PL2_PATH));
+  printf("  \"pl2_w\": %d,\n", rapl_watts(RAPL_PL2_PATH));
+  print_msr_fields();
+  printf("  \"ec_quiet_turbo\": %d\n", bit_get(REG_QUIET, BIT_QUIET));
   printf("}\n");
 }
 
@@ -485,5 +599,7 @@ int main(int argc, char **argv) {
 
   if (ec_fd >= 0)
     close(ec_fd);
+  if (msr_fd >= 0)
+    close(msr_fd);
   return 0;
 }

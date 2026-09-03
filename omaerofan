@@ -16,18 +16,29 @@ HELPER = Path("/usr/local/libexec/omaerofan-ec")
 PLUGIN_ID = "jabe.omaerofan"
 STATE_PATH = Path.home() / ".config/omaerofan/state.json"
 POWER_PATH = Path.home() / ".config/omaerofan/power.json"
+CURVE_PATH = Path.home() / ".config/omaerofan/curve.json"
 RAPL_PKG = Path("/sys/class/powercap/intel-rapl:0")
 DEFAULT_PROFILES = {
     "power-saver": {"pl1": 25, "pl2": 35},
     "balanced": {"pl1": 35, "pl2": 50},
     "performance": {"pl1": 45, "pl2": 135},
 }
-MODES = ("auto", "quiet", "gaming", "manual")
+DEFAULT_CURVE_POINTS = [
+    [50, 12],
+    [58, 16],
+    [65, 22],
+    [72, 32],
+    [80, 48],
+    [88, 70],
+    [95, 100],
+]
+MODES = ("auto", "quiet", "gaming", "manual", "curve")
 MODE_LABELS = {
     "auto": "AUTO",
     "quiet": "QUIET",
     "gaming": "GAMING",
     "manual": "MANUAL",
+    "curve": "CURVE",
 }
 
 
@@ -62,6 +73,9 @@ def save_state(data: dict) -> None:
         "battery_on": bool(data.get("battery_on")),
         "battery_limit": limit,
     }
+    if payload["mode"] == "curve":
+        payload["curve_pct"] = data.get("curve_pct")
+        payload["curve_temp"] = data.get("curve_temp")
     STATE_PATH.write_text(json.dumps(payload, indent=2) + "\n")
 
 
@@ -84,6 +98,10 @@ def step_fan(pct: int, delta: int) -> int:
 
 def clamp_batt(pct: int) -> int:
     return max(20, min(100, pct))
+
+
+def clamp_curve_min(pct: int) -> int:
+    return max(8, min(40, pct))
 
 
 def sysfs_cpu_temp() -> int | None:
@@ -149,6 +167,85 @@ def load_power_config() -> dict:
     return cfg
 
 
+def default_curve_config() -> dict:
+    return {
+        "min_pct": 12,
+        "hysteresis": 3,
+        "points": [list(p) for p in DEFAULT_CURVE_POINTS],
+    }
+
+
+def load_curve_config() -> dict:
+    cfg = default_curve_config()
+    if not CURVE_PATH.exists():
+        return cfg
+    try:
+        data = json.loads(CURVE_PATH.read_text())
+    except json.JSONDecodeError:
+        return cfg
+    if not isinstance(data, dict):
+        return cfg
+    if isinstance(data.get("min_pct"), (int, float)):
+        cfg["min_pct"] = clamp_curve_min(int(data["min_pct"]))
+    if isinstance(data.get("hysteresis"), (int, float)):
+        cfg["hysteresis"] = max(0, min(10, int(data["hysteresis"])))
+    raw_pts = data.get("points")
+    points = []
+    if isinstance(raw_pts, list):
+        for item in raw_pts:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    points.append([int(item[0]), clamp_fan(int(item[1]))])
+                except (TypeError, ValueError):
+                    continue
+    if len(points) >= 2:
+        points.sort(key=lambda p: p[0])
+        cfg["points"] = points
+    return cfg
+
+
+def write_curve_config(cfg: dict) -> None:
+    CURVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "min_pct": clamp_curve_min(int(cfg.get("min_pct", 12))),
+        "hysteresis": max(0, min(10, int(cfg.get("hysteresis", 3)))),
+        "points": cfg.get("points") or [list(p) for p in DEFAULT_CURVE_POINTS],
+    }
+    CURVE_PATH.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def write_default_curve_config() -> None:
+    if CURVE_PATH.exists():
+        return
+    write_curve_config(default_curve_config())
+
+
+def interpolate_curve(temp: int, points: list[list[int]], min_pct: int) -> int:
+    pts = [(int(t), int(p)) for t, p in points]
+    if not pts:
+        return min_pct
+    if temp <= pts[0][0]:
+        pct = pts[0][1]
+    elif temp >= pts[-1][0]:
+        pct = pts[-1][1]
+    else:
+        pct = pts[-1][1]
+        for i in range(1, len(pts)):
+            t0, p0 = pts[i - 1]
+            t1, p1 = pts[i]
+            if temp <= t1:
+                if t1 == t0:
+                    pct = p1
+                else:
+                    pct = p0 + (p1 - p0) * (temp - t0) / (t1 - t0)
+                break
+    if temp >= 92:
+        pct = max(pct, 80)
+    if temp >= 96:
+        pct = 100
+    return clamp_fan(max(min_pct, int(round(pct))))
+
+
 def write_default_power_config() -> None:
     if POWER_PATH.exists():
         return
@@ -158,6 +255,61 @@ def write_default_power_config() -> None:
         "profiles": {k: dict(v) for k, v in DEFAULT_PROFILES.items()},
     }
     POWER_PATH.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+BRAKE_LABELS = {
+    "prochot": "PROCHOT",
+    "thermal": "thermal",
+    "graphics": "graphics",
+    "autonomous": "HWP",
+    "vr-therm": "VR therm",
+    "vr-tdc": "VR TDC",
+    "edp": "EDP",
+    "pl1": "RAPL PL1",
+    "pl2": "RAPL PL2",
+    "max-turbo": "max turbo",
+    "turbo-atten": "turbo atten",
+    "max-eff": "max efficiency",
+}
+
+
+def _ghz(mhz: object) -> str:
+    if not isinstance(mhz, (int, float)) or mhz <= 0:
+        return ""
+    return f"{round(int(mhz) / 100) / 10:.1f} GHz"
+
+
+def brake_summary(data: dict) -> str:
+    parts: list[str] = []
+    skip = {
+        "max-eff",
+        "autonomous",
+        "max-turbo",
+        "turbo-atten",
+        "pl1",
+        "pl2",
+        "graphics",
+    }
+    quiet = bool(data.get("quiet") or data.get("mode") == "quiet")
+    if quiet:
+        parts.append("EC quiet · EDP cap")
+    for name in data.get("brakes") or []:
+        key = str(name)
+        if key in skip or (quiet and key == "edp"):
+            continue
+        label = BRAKE_LABELS.get(key, key)
+        if label not in parts:
+            parts.append(label)
+    if data.get("therm_prochot") and "PROCHOT" not in parts:
+        parts.append("PROCHOT")
+    hwp = data.get("hwp_max_mhz")
+    turbo = data.get("turbo_mhz")
+    if isinstance(hwp, int) and isinstance(turbo, int) and hwp > 0 and turbo > 0 and hwp + 50 < turbo:
+        parts.append(f"HWP max {_ghz(hwp)}")
+    now = data.get("perf_mhz")
+    if quiet and isinstance(now, int) and now > 0 and isinstance(turbo, int) and turbo > 0:
+        parts.append(f"{_ghz(now)} / {_ghz(turbo)}")
+    return "none" if not parts else " · ".join(parts)
 
 
 def profile_limits(profile: str) -> tuple[int, int]:
@@ -201,6 +353,14 @@ def enrich(data: dict) -> dict:
         data["pl2_w"] = rapl[1]
     data["power_profile"] = current_profile()
     data["follow_power_profile"] = load_power_config()["follow_power_profile"]
+    curve = load_curve_config()
+    data["curve_min"] = curve["min_pct"]
+    data["curve_points"] = curve["points"]
+    saved = load_state() or {}
+    if saved.get("mode") == "curve" and data.get("mode") == "manual":
+        data["mode"] = "curve"
+        data["curve_pct"] = saved.get("curve_pct", data.get("fan0_pct"))
+        data["curve_temp"] = saved.get("curve_temp")
     return data
 
 
@@ -221,6 +381,11 @@ def print_status(data: dict) -> None:
     follow = "follow" if data.get("follow_power_profile") else "manual"
     rapl = f"{pl1}/{pl2} W" if pl1 is not None and pl2 is not None else "-"
     print(f"power      {profile}   {rapl}   {follow}")
+    print(f"brake      {brake_summary(data)}")
+    if data.get("mode") == "curve":
+        print(
+            f"curve      {data.get('curve_pct')}% @ {data.get('curve_temp') or data.get('cpu_temp')} C   floor {data.get('curve_min')}%"
+        )
 
 
 def emit_json(payload: dict) -> None:
@@ -256,7 +421,9 @@ def cmd_restore() -> int:
         else:
             run_helper("battery", "off")
         mode = saved.get("mode") or "auto"
-        if mode == "manual":
+        if mode == "curve":
+            cmd_apply_curve(quiet=True, enable=True)
+        elif mode == "manual":
             run_helper(
                 "fans",
                 str(clamp_fan(int(saved.get("fan0_pct") or 50))),
@@ -298,6 +465,56 @@ def cmd_sync(*, quiet: bool = False) -> int:
         raise
     if not quiet:
         print_status(status())
+    return 0
+
+
+def cmd_apply_curve(*, quiet: bool = False, enable: bool = False) -> int:
+    write_default_curve_config()
+    saved = load_state() or {}
+    if not enable and saved.get("mode") != "curve":
+        return 0
+    cfg = load_curve_config()
+    data = enrich(status())
+    temp = max(
+        int(data.get("cpu_temp") or 0),
+        int(data.get("gpu_temp") or 0),
+        int(data.get("mlb_temp") or 0),
+    )
+    target = interpolate_curve(temp, cfg["points"], cfg["min_pct"])
+    last = int(saved.get("curve_pct") or target)
+    last_temp = int(saved.get("curve_temp") or temp)
+    hyst = int(cfg.get("hysteresis") or 3)
+    if temp >= 90:
+        pct = 100
+    elif target >= last:
+        pct = target
+    elif temp <= last_temp - hyst:
+        pct = max(target, last - 2)
+    else:
+        pct = last
+    data = json.loads(run_helper("fans", str(pct), str(pct)))
+    data["mode"] = "curve"
+    data["curve_pct"] = pct
+    data["curve_temp"] = temp
+    save_state(data)
+    if not quiet:
+        print_status(data)
+    return 0
+
+
+def cmd_curve(*, quiet: bool = False) -> int:
+    return cmd_apply_curve(quiet=quiet, enable=True)
+
+
+def cmd_curve_min(pct: int) -> int:
+    write_default_curve_config()
+    cfg = load_curve_config()
+    cfg["min_pct"] = clamp_curve_min(pct)
+    write_curve_config(cfg)
+    saved = load_state() or {}
+    if saved.get("mode") == "curve":
+        return cmd_apply_curve()
+    print_status(enrich(status()))
     return 0
 
 
@@ -348,6 +565,8 @@ class Ui:
 
     def refresh(self) -> None:
         try:
+            if (load_state() or {}).get("mode") == "curve":
+                cmd_apply_curve(quiet=True)
             self.data = enrich(status())
             self.err = ""
         except Exception as exc:  # noqa: BLE001
@@ -362,6 +581,14 @@ class Ui:
             self.err = str(exc)
 
     def set_mode(self, mode: str) -> None:
+        if mode == "curve":
+            try:
+                cmd_curve(quiet=True)
+                self.refresh()
+                self.err = ""
+            except Exception as exc:  # noqa: BLE001
+                self.err = str(exc)
+            return
         self.apply("mode", mode)
 
     def nudge_fan(self, which: str, delta: int) -> None:
@@ -440,6 +667,9 @@ class Ui:
         pl2 = d.get("pl2_w")
         rapl = f"{pl1}/{pl2}W" if pl1 is not None and pl2 is not None else "-"
         self.add(5, 2, f"{profile}  {rapl}", curses.A_DIM)
+        brake = brake_summary(d)
+        brake_attr = curses.color_pair(3) | curses.A_BOLD if (d.get("quiet") or (d.get("brakes") or [])) and curses.has_colors() else curses.A_DIM
+        self.add(5, 22, brake[: max(0, w - 24)], brake_attr)
 
         mode = d.get("mode") or "auto"
         self.add(6, 2, "MODE", curses.A_DIM)
@@ -485,7 +715,7 @@ class Ui:
         if self.err:
             self.add(14, 2, self.err, curses.color_pair(4) if curses.has_colors() else curses.A_BOLD)
         backend = d.get("backend") or "?"
-        self.add(h - 2, 2, f"1-4 mode   j/k select   h/l adjust   b battery   d dump   q quit   {backend}", curses.A_DIM)
+        self.add(h - 2, 2, f"1-5 mode   j/k select   h/l adjust   b battery   d dump   q quit   {backend}", curses.A_DIM)
         self.stdscr.refresh()
 
     def cycle_mode(self, delta: int) -> None:
@@ -516,6 +746,8 @@ class Ui:
             self.set_mode("gaming")
         elif key in (ord("4"),):
             self.set_mode("manual")
+        elif key in (ord("5"),):
+            self.set_mode("curve")
         elif key in (ord("b"),):
             self.toggle_batt()
         elif key in (curses.KEY_DOWN, ord("j"), 9):
@@ -581,7 +813,9 @@ def usage() -> None:
   omaerofan                 status
   omaerofan json            JSON status (Omarchy plugin)
   omaerofan ui              TUI
-  omaerofan auto|quiet|gaming|manual
+  omaerofan auto|quiet|gaming|manual|curve
+  omaerofan apply-curve     follow software fan curve (no-op unless curve)
+  omaerofan curve-min <pct> curve floor 8-40
   omaerofan cpu <pct>       manual CPU fan  (0-100)
   omaerofan gpu <pct>       manual GPU fan
   omaerofan fans <pct> [gpu-pct]
@@ -610,6 +844,12 @@ def main(argv: list[str]) -> int:
         if cmd in ("ui", "tui"):
             curses.wrapper(lambda stdscr: Ui(stdscr).loop())
             return 0
+        if cmd == "curve":
+            return cmd_curve()
+        if cmd == "apply-curve":
+            return cmd_apply_curve()
+        if cmd == "curve-min" and len(argv) == 2:
+            return cmd_curve_min(int(argv[1]))
         if cmd in MODES:
             data = json.loads(run_helper("mode", cmd))
             save_state(data)

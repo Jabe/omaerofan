@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "jabe.omaerofan",
   "name": "Omaerofan",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "author": "Jan Berdel",
   "license": "MIT",
-  "description": "Gigabyte AERO 17 fan speeds, RAPL power limits, and charge-limit control.",
+  "description": "Gigabyte AERO 17 fan curve, RAPL power limits, and charge-limit control.",
   "kinds": [
     "bar-widget",
     "service"

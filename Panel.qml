@@ -24,6 +24,7 @@ Panel {
   property int previewCpu: -1
   property int previewGpu: -1
   property int previewBatt: -1
+  property int previewFloor: -1
   property string focusSection: "mode"
   property int selectedIndex: 0
   property bool cursorActive: false
@@ -39,24 +40,30 @@ Panel {
   readonly property int gpuFan: previewGpu >= 0 ? previewGpu : Model.clampFan(status.fan1_pct)
   readonly property bool batteryOn: status.battery_on === true || status.battery_on === 1
   readonly property int batteryLimit: previewBatt >= 0 ? previewBatt : Model.clampBatt(status.battery_limit)
-  readonly property bool dragging: previewCpu >= 0 || previewGpu >= 0 || previewBatt >= 0
-    || fanDebounce.running || battDebounce.running
+  readonly property int curveFloor: previewFloor >= 0 ? previewFloor : Model.clampCurveMin(status.curve_min)
+  readonly property int curvePct: Model.num(status.curve_pct, cpuFan)
+  readonly property bool dragging: fanDebounce.running || battDebounce.running || floorDebounce.running
   readonly property bool hot: Model.hottestTemp(status) >= 85
   readonly property string powerCaption: Model.powerCaption(status)
+  readonly property string brakeCaption: Model.brakeCaption(status)
+  readonly property bool cpuCapped: Model.isCpuCapped(status)
   readonly property var modeOptions: [
     { id: "auto", label: "Auto" },
     { id: "quiet", label: "Quiet" },
     { id: "gaming", label: "Gaming" },
-    { id: "manual", label: "Manual" }
+    { id: "manual", label: "Manual" },
+    { id: "curve", label: "Curve" }
   ]
   readonly property var visibleSections: {
     if (!installed) return ["install"]
+    if (mode === "curve") return ["mode", "floor", "battery"]
     return ["mode", "cpu", "gpu", "battery"]
   }
   readonly property color dim: Qt.darker(barForeground, 1.4)
   readonly property string heroStatusText: {
     if (!installed) return "HELPER MISSING"
     if (lastError) return "ERROR"
+    if (root.cpuCapped) return "CPU CAPPED"
     return Model.modeStatus(mode)
   }
 
@@ -65,15 +72,19 @@ Panel {
     status = parsed
     if (parsed.ok === false) lastError = String(parsed.error || "status failed")
     else lastError = ""
-    if (!root.dragging) {
+    if (!fanDebounce.running) {
       previewCpu = -1
       previewGpu = -1
-      previewBatt = -1
+    }
+    if (!battDebounce.running) previewBatt = -1
+    if (!floorDebounce.running) {
+      if (previewFloor < 0 || Model.clampCurveMin(parsed.curve_min) === previewFloor)
+        previewFloor = -1
     }
   }
 
   function refresh() {
-    if (statusProc.running || dragging) return
+    if (statusProc.running) return
     statusProc.command = [root.cli, "json"]
     statusProc.running = true
   }
@@ -137,6 +148,16 @@ Panel {
     setBattery(true, batteryLimit)
   }
 
+  function previewFloorValue(value) {
+    previewFloor = Model.clampCurveMin(value)
+    floorDebounce.restart()
+  }
+
+  function commitFloor() {
+    floorDebounce.stop()
+    runCli(["curve-min", String(Model.clampCurveMin(curveFloor))])
+  }
+
   function installHelper() {
     if (installProc.running) return
     lastError = ""
@@ -186,6 +207,7 @@ Panel {
     }
     if (focusSection === "cpu") nudgeFan("cpu", delta * 5)
     else if (focusSection === "gpu") nudgeFan("gpu", delta * 5)
+    else if (focusSection === "floor") previewFloorValue(curveFloor + delta * 1)
     else if (focusSection === "battery") {
       if (!batteryOn) setBattery(true, batteryLimit)
       else previewBattery(batteryLimit + delta * 5)
@@ -203,6 +225,7 @@ Panel {
     else if (text === "2") setMode("quiet")
     else if (text === "3") setMode("gaming")
     else if (text === "4") setMode("manual")
+    else if (text === "5") setMode("curve")
     else if (text === "b" || text === "B") toggleBattery()
     else if (text === "r" || text === "R") refresh()
     else if (text === "i" || text === "I") installHelper()
@@ -284,14 +307,21 @@ Panel {
     onTriggered: root.commitBattery()
   }
 
+  Timer {
+    id: floorDebounce
+    interval: 180
+    repeat: false
+    onTriggered: root.commitFloor()
+  }
+
   BarIconButton {
     id: button
     anchors.fill: parent
     bar: root.bar
     text: Model.fanIcon(root.mode)
     slotSize: Style.bar.iconSlot
-    active: root.hot
-    tooltipText: ""
+    active: root.cpuCapped || root.hot
+    tooltipText: root.cpuCapped ? root.brakeCaption : root.powerCaption
     onPressed: function(b) { root.toggle() }
   }
 
@@ -364,7 +394,9 @@ Panel {
 
               Text {
                 text: root.heroStatusText
-                color: root.dim
+                color: root.cpuCapped
+                  ? (bar && bar.urgent ? bar.urgent : Color.accent)
+                  : root.dim
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
@@ -439,6 +471,20 @@ Panel {
             elide: Text.ElideRight
           }
 
+          Text {
+            visible: root.installed
+            width: parent.width
+            text: root.brakeCaption
+            wrapMode: Text.WordWrap
+            color: root.cpuCapped
+              ? (bar && bar.urgent ? bar.urgent : Color.accent)
+              : root.dim
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 0.8
+          }
+
           PanelSeparator {
             visible: root.installed
             foreground: root.bar.foreground
@@ -457,7 +503,9 @@ Panel {
 
             Text {
               width: parent.width
-              text: "RAPL follows the Omarchy power profile. Fans stay as set."
+              text: mode === "curve"
+                ? "Software curve on manual duty. RAPL still follows the power profile."
+                : "RAPL follows the Omarchy power profile. Curve replaces the loud EC auto map."
               wrapMode: Text.WordWrap
               color: root.dim
               font.family: root.bar.fontFamily
@@ -468,7 +516,7 @@ Panel {
               id: modeRow
               width: parent.width
               spacing: Style.space(6)
-              readonly property real cellWidth: (width - spacing * 3) / 4
+              readonly property real cellWidth: (width - spacing * 4) / 5
 
               Repeater {
                 model: root.modeOptions
@@ -498,9 +546,39 @@ Panel {
             }
           }
 
+          Text {
+            visible: root.installed && root.mode === "curve"
+            width: parent.width
+            text: Model.curveCaption(root.status, root.curveFloor)
+            color: root.bar.foreground
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+
+          Text {
+            visible: root.installed && root.mode === "curve"
+            width: parent.width
+            text: Model.curvePointsText(root.status, root.curveFloor)
+            wrapMode: Text.WordWrap
+            color: root.dim
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            visible: root.installed && root.mode === "curve"
+            width: parent.width
+            text: root.fan0Rpm + " / " + root.fan1Rpm + " rpm"
+            color: root.dim
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+
           FanSlider {
             id: cpuFanRow
-            visible: root.installed
+            visible: root.installed && root.mode !== "curve"
             width: parent.width
             title: "CPU FAN"
             rpm: root.fan0Rpm
@@ -512,7 +590,7 @@ Panel {
 
           FanSlider {
             id: gpuFanRow
-            visible: root.installed
+            visible: root.installed && root.mode !== "curve"
             width: parent.width
             title: "GPU FAN"
             rpm: root.fan1Rpm
@@ -520,6 +598,72 @@ Panel {
             value: root.gpuFan
             onPreview: function(v) { root.previewFan("gpu", v) }
             onCommit: root.commitFans()
+          }
+
+          Column {
+            visible: root.installed && root.mode === "curve"
+            width: parent.width
+            spacing: Style.space(6)
+
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(floorHeader.implicitHeight, floorValue.implicitHeight)
+
+              PanelSectionHeader {
+                id: floorHeader
+                text: "FLOOR"
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                id: floorValue
+                text: root.curveFloor + "%"
+                color: root.dim
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            CursorSurface {
+              width: parent.width
+              height: floorSlider.implicitHeight + Style.spacing.controlGap
+              hasCursor: root.cursorActive && root.focusSection === "floor"
+              foreground: root.bar.foreground
+              outline: true
+
+              PanelSlider {
+                id: floorSlider
+                bar: root.bar
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(6)
+                anchors.rightMargin: Style.space(6)
+                minimum: 8
+                maximum: 40
+                step: 1
+                integer: true
+                value: root.curveFloor
+                onMoved: function(v) { root.previewFloorValue(v) }
+                onReleased: function(v) {
+                  root.previewFloor = Model.clampCurveMin(v)
+                  root.commitFloor()
+                }
+              }
+
+              HoverHandler {
+                onHoveredChanged: if (hovered) {
+                  root.cursorActive = true
+                  root.focusSection = "floor"
+                  root.selectedIndex = -1
+                }
+              }
+            }
           }
 
           PanelSeparator {
