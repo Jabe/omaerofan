@@ -41,9 +41,19 @@
 #define BIT_FANCTL 3
 
 #define DUTY_MAX 229
+#define RAPL_MIN_W 8
+#define RAPL_MAX_W 200
 
 static const char *EC_SYS_PATH = "/sys/kernel/debug/ec/ec0/io";
 static const char *EC_DEV_PATH = "/dev/ec";
+static const char *RAPL_PL1_PATH =
+    "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw";
+static const char *RAPL_PL2_PATH =
+    "/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw";
+static const char *RAPL_PL1_MAX_PATH =
+    "/sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw";
+static const char *RAPL_PL2_MAX_PATH =
+    "/sys/class/powercap/intel-rapl:0/constraint_1_max_power_uw";
 
 enum backend { BACKEND_NONE, BACKEND_SYSFS, BACKEND_DEV, BACKEND_PORT };
 
@@ -284,6 +294,78 @@ static void apply_fans(int cpu_pct, int gpu_pct) {
   must_write(REG_FAN1, (uint8_t)pct_to_duty(gpu_pct));
 }
 
+static int read_u64_file(const char *path, unsigned long long *val) {
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return -1;
+  int n = fscanf(f, "%llu", val);
+  fclose(f);
+  return n == 1 ? 0 : -1;
+}
+
+static int write_u64_file(const char *path, unsigned long long val) {
+  FILE *f = fopen(path, "w");
+  if (!f)
+    return -1;
+  int n = fprintf(f, "%llu\n", val);
+  int err = ferror(f);
+  fclose(f);
+  return n > 0 && !err ? 0 : -1;
+}
+
+static int rapl_watts(const char *path) {
+  unsigned long long uw = 0;
+  if (read_u64_file(path, &uw) < 0)
+    return -1;
+  return (int)((uw + 500000ULL) / 1000000ULL);
+}
+
+static unsigned long long rapl_max_uw(const char *path, unsigned long long fallback) {
+  unsigned long long uw = 0;
+  if (read_u64_file(path, &uw) == 0 && uw > 0)
+    return uw;
+  return fallback;
+}
+
+static int clamp_rapl_w(int watts, const char *max_path) {
+  if (watts < RAPL_MIN_W)
+    watts = RAPL_MIN_W;
+  if (watts > RAPL_MAX_W)
+    watts = RAPL_MAX_W;
+  unsigned long long max_uw = rapl_max_uw(max_path, 0);
+  if (max_uw > 0) {
+    int max_w = (int)(max_uw / 1000000ULL);
+    if (max_w >= RAPL_MIN_W && watts > max_w)
+      watts = max_w;
+  }
+  return watts;
+}
+
+static void apply_rapl(int pl1_w, int pl2_w) {
+  if (pl1_w < RAPL_MIN_W || pl1_w > RAPL_MAX_W || pl2_w < RAPL_MIN_W ||
+      pl2_w > RAPL_MAX_W)
+    die("rapl watts must be 8-200");
+
+  pl1_w = clamp_rapl_w(pl1_w, RAPL_PL1_MAX_PATH);
+  pl2_w = clamp_rapl_w(pl2_w, RAPL_PL2_MAX_PATH);
+  if (pl1_w > pl2_w)
+    pl2_w = pl1_w;
+
+  int cur_pl1 = rapl_watts(RAPL_PL1_PATH);
+  unsigned long long pl1_uw = (unsigned long long)pl1_w * 1000000ULL;
+  unsigned long long pl2_uw = (unsigned long long)pl2_w * 1000000ULL;
+
+  /* Keep PL1 <= PL2 while writing. */
+  if (cur_pl1 < 0 || pl1_w < cur_pl1) {
+    if (write_u64_file(RAPL_PL1_PATH, pl1_uw) < 0)
+      die_errno("RAPL PL1 write failed");
+  }
+  if (write_u64_file(RAPL_PL2_PATH, pl2_uw) < 0)
+    die_errno("RAPL PL2 write failed");
+  if (write_u64_file(RAPL_PL1_PATH, pl1_uw) < 0)
+    die_errno("RAPL PL1 write failed");
+}
+
 static void apply_battery(int on, int pct) {
   if (on) {
     if (pct < 20 || pct > 100)
@@ -321,7 +403,9 @@ static void print_status(void) {
   printf("  \"fan1_pct\": %d,\n", duty_to_pct(fan1));
   printf("  \"mode\": \"%s\",\n", detect_mode());
   printf("  \"battery_on\": %d,\n", batt_on);
-  printf("  \"battery_limit\": %u\n", must_read(REG_CHARGE_PCT));
+  printf("  \"battery_limit\": %u,\n", must_read(REG_CHARGE_PCT));
+  printf("  \"pl1_w\": %d,\n", rapl_watts(RAPL_PL1_PATH));
+  printf("  \"pl2_w\": %d\n", rapl_watts(RAPL_PL2_PATH));
   printf("}\n");
 }
 
@@ -346,6 +430,7 @@ static void usage(void) {
           "       omaerofan-ec fans <cpu-pct> <gpu-pct>\n"
           "       omaerofan-ec battery off\n"
           "       omaerofan-ec battery <pct>\n"
+          "       omaerofan-ec rapl [<pl1-w> <pl2-w>]\n"
           "       omaerofan-ec write <reg> <val>\n");
   exit(2);
 }
@@ -381,6 +466,11 @@ int main(int argc, char **argv) {
       apply_battery(0, 0);
     else
       apply_battery(1, atoi(argv[2]));
+    print_status();
+  } else if (strcmp(argv[1], "rapl") == 0 && argc == 2) {
+    print_status();
+  } else if (strcmp(argv[1], "rapl") == 0 && argc == 4) {
+    apply_rapl(atoi(argv[2]), atoi(argv[3]));
     print_status();
   } else if (strcmp(argv[1], "write") == 0 && argc == 4) {
     uint8_t reg = (uint8_t)parse_num(argv[2]);

@@ -60,6 +60,16 @@ function tempTone(temp) {
   return "ok"
 }
 
+function powerCaption(data) {
+  var profile = String(data && data.power_profile || "")
+  var pl1 = num(data && data.pl1_w, 0)
+  var pl2 = num(data && data.pl2_w, 0)
+  if (!profile && !pl1 && !pl2) return ""
+  var name = profile || "rapl"
+  if (!pl1 && !pl2) return name
+  return name + " · " + pl1 + "/" + pl2 + " W"
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     num: num,
@@ -71,6 +81,7 @@ if (typeof module !== "undefined") {
     modeStatus: modeStatus,
     fanIcon: fanIcon,
     hottestTemp: hottestTemp,
-    tempTone: tempTone
+    tempTone: tempTone,
+    powerCaption: powerCaption
   }
 }

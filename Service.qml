@@ -18,11 +18,16 @@ Item {
   readonly property string cli: pluginDir + "/omaerofan"
 
   property int restoreAttempt: 0
+  property int syncAttempt: 0
 
   function scheduleRestore() {
     restoreAttempt = 0
     restoreDelay.interval = 1000
     restoreDelay.restart()
+  }
+
+  function scheduleSync() {
+    syncDebounce.restart()
   }
 
   function runRestore() {
@@ -31,10 +36,22 @@ Item {
     restoreProc.running = true
   }
 
+  function runSync() {
+    if (syncProc.running || restoreProc.running) {
+      syncDebounce.restart()
+      return
+    }
+    syncProc.command = [root.cli, "sync"]
+    syncProc.running = true
+  }
+
+  Component.onCompleted: root.scheduleSync()
+
   Process {
     id: sleepWatch
     running: true
     command: [
+      "stdbuf", "-oL",
       "dbus-monitor",
       "--system",
       "type='signal',sender='org.freedesktop.login1',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'"
@@ -47,6 +64,23 @@ Item {
     }
   }
 
+  Process {
+    id: profileWatch
+    running: true
+    command: [
+      "stdbuf", "-oL",
+      "dbus-monitor",
+      "--system",
+      "type='signal',path='/org/freedesktop/UPower/PowerProfiles',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'"
+    ]
+    stdout: SplitParser {
+      onRead: function(line) {
+        if (String(line).indexOf("ActiveProfile") >= 0)
+          root.scheduleSync()
+      }
+    }
+  }
+
   Timer {
     id: restoreDelay
     interval: 1000
@@ -54,14 +88,45 @@ Item {
     onTriggered: root.runRestore()
   }
 
+  Timer {
+    id: syncDebounce
+    interval: 250
+    repeat: false
+    onTriggered: root.runSync()
+  }
+
+  Timer {
+    interval: 5000
+    running: true
+    repeat: true
+    onTriggered: root.scheduleSync()
+  }
+
   Process {
     id: restoreProc
     onExited: function(exitCode) {
-      if (exitCode === 0) return
+      if (exitCode === 0) {
+        root.restoreAttempt = 0
+        return
+      }
       root.restoreAttempt += 1
       if (root.restoreAttempt >= 12) return
       restoreDelay.interval = 500
       restoreDelay.restart()
+    }
+  }
+
+  Process {
+    id: syncProc
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.syncAttempt = 0
+        return
+      }
+      root.syncAttempt += 1
+      if (root.syncAttempt >= 8) return
+      syncDebounce.interval = 750
+      syncDebounce.restart()
     }
   }
 }

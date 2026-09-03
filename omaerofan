@@ -15,6 +15,13 @@ from pathlib import Path
 HELPER = Path("/usr/local/libexec/omaerofan-ec")
 PLUGIN_ID = "jabe.omaerofan"
 STATE_PATH = Path.home() / ".config/omaerofan/state.json"
+POWER_PATH = Path.home() / ".config/omaerofan/power.json"
+RAPL_PKG = Path("/sys/class/powercap/intel-rapl:0")
+DEFAULT_PROFILES = {
+    "power-saver": {"pl1": 25, "pl2": 35},
+    "balanced": {"pl1": 35, "pl2": 50},
+    "performance": {"pl1": 45, "pl2": 135},
+}
 MODES = ("auto", "quiet", "gaming", "manual")
 MODE_LABELS = {
     "auto": "AUTO",
@@ -96,6 +103,71 @@ def sysfs_cpu_temp() -> int | None:
     return None
 
 
+def read_rapl() -> tuple[int, int] | None:
+    try:
+        pl1 = int((RAPL_PKG / "constraint_0_power_limit_uw").read_text())
+        pl2 = int((RAPL_PKG / "constraint_1_power_limit_uw").read_text())
+        return (pl1 + 500_000) // 1_000_000, (pl2 + 500_000) // 1_000_000
+    except (OSError, ValueError):
+        return None
+
+
+def current_profile() -> str:
+    proc = subprocess.run(
+        ["powerprofilesctl", "get"],
+        capture_output=True,
+        text=True,
+    )
+    name = (proc.stdout or "").strip()
+    return name if proc.returncode == 0 and name else "balanced"
+
+
+def load_power_config() -> dict:
+    cfg = {
+        "follow_power_profile": True,
+        "profiles": {k: dict(v) for k, v in DEFAULT_PROFILES.items()},
+    }
+    if not POWER_PATH.exists():
+        return cfg
+    try:
+        data = json.loads(POWER_PATH.read_text())
+    except json.JSONDecodeError:
+        return cfg
+    if not isinstance(data, dict):
+        return cfg
+    if "follow_power_profile" in data:
+        cfg["follow_power_profile"] = bool(data["follow_power_profile"])
+    raw = data.get("profiles")
+    if isinstance(raw, dict):
+        for name, spec in raw.items():
+            if not isinstance(spec, dict):
+                continue
+            pl1 = spec.get("pl1")
+            pl2 = spec.get("pl2")
+            if isinstance(pl1, (int, float)) and isinstance(pl2, (int, float)):
+                cfg["profiles"][str(name)] = {"pl1": int(pl1), "pl2": int(pl2)}
+    return cfg
+
+
+def write_default_power_config() -> None:
+    if POWER_PATH.exists():
+        return
+    POWER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "follow_power_profile": True,
+        "profiles": {k: dict(v) for k, v in DEFAULT_PROFILES.items()},
+    }
+    POWER_PATH.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def profile_limits(profile: str) -> tuple[int, int]:
+    cfg = load_power_config()
+    spec = cfg["profiles"].get(profile) or DEFAULT_PROFILES.get(profile)
+    if not spec:
+        spec = DEFAULT_PROFILES["balanced"]
+    return int(spec["pl1"]), int(spec["pl2"])
+
+
 def nvidia_gpu_temp() -> int | None:
     if not shutil.which("nvidia-smi"):
         return None
@@ -123,6 +195,12 @@ def enrich(data: dict) -> dict:
         if gpu is not None:
             data["gpu_temp"] = gpu
             data["gpu_temp_src"] = "nvidia"
+    rapl = read_rapl()
+    if rapl is not None:
+        data["pl1_w"] = rapl[0]
+        data["pl2_w"] = rapl[1]
+    data["power_profile"] = current_profile()
+    data["follow_power_profile"] = load_power_config()["follow_power_profile"]
     return data
 
 
@@ -137,6 +215,12 @@ def print_status(data: dict) -> None:
     print(f"fan1       {data.get('fan1_rpm')} rpm   {data.get('fan1_pct')}%")
     batt = "off" if not data.get("battery_on") else f"{data.get('battery_limit')}%"
     print(f"battery    {batt}")
+    profile = data.get("power_profile") or "-"
+    pl1 = data.get("pl1_w")
+    pl2 = data.get("pl2_w")
+    follow = "follow" if data.get("follow_power_profile") else "manual"
+    rapl = f"{pl1}/{pl2} W" if pl1 is not None and pl2 is not None else "-"
+    print(f"power      {profile}   {rapl}   {follow}")
 
 
 def emit_json(payload: dict) -> None:
@@ -166,23 +250,54 @@ def cmd_json() -> int:
 
 def cmd_restore() -> int:
     saved = load_state()
+    if saved:
+        if saved.get("battery_on"):
+            run_helper("battery", str(clamp_batt(int(saved.get("battery_limit") or 60))))
+        else:
+            run_helper("battery", "off")
+        mode = saved.get("mode") or "auto"
+        if mode == "manual":
+            run_helper(
+                "fans",
+                str(clamp_fan(int(saved.get("fan0_pct") or 50))),
+                str(clamp_fan(int(saved.get("fan1_pct") or 50))),
+            )
+        else:
+            run_helper("mode", mode)
+    try:
+        cmd_sync(quiet=True)
+    except RuntimeError as exc:
+        print(f"rapl sync skipped: {exc}", file=sys.stderr)
     if not saved:
-        print("no saved state")
-        return 1
-    if saved.get("battery_on"):
-        run_helper("battery", str(clamp_batt(int(saved.get("battery_limit") or 60))))
-    else:
-        run_helper("battery", "off")
-    mode = saved.get("mode") or "auto"
-    if mode == "manual":
-        run_helper(
-            "fans",
-            str(clamp_fan(int(saved.get("fan0_pct") or 50))),
-            str(clamp_fan(int(saved.get("fan1_pct") or 50))),
-        )
-    else:
-        run_helper("mode", mode)
+        print("no saved fan state")
     print_status(status())
+    return 0
+
+
+def cmd_sync(*, quiet: bool = False) -> int:
+    write_default_power_config()
+    cfg = load_power_config()
+    if not cfg["follow_power_profile"]:
+        if not quiet:
+            print("power profile follow disabled")
+            print_status(status())
+        return 0
+    profile = current_profile()
+    pl1, pl2 = profile_limits(profile)
+    current = read_rapl()
+    if current == (pl1, pl2):
+        if not quiet:
+            print_status(status())
+        return 0
+    try:
+        run_helper("rapl", str(pl1), str(pl2))
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "usage:" in msg:
+            raise RuntimeError("helper too old for RAPL — run: omaerofan install") from exc
+        raise
+    if not quiet:
+        print_status(status())
     return 0
 
 
@@ -320,6 +435,11 @@ class Ui:
         self.add(3, 30, f"{mlb:3d}°", self.temp_attr(mlb))
         self.add(4, 2, f"FAN0 {int(d.get('fan0_rpm') or 0):4d} rpm", curses.A_NORMAL)
         self.add(4, 20, f"FAN1 {int(d.get('fan1_rpm') or 0):4d} rpm", curses.A_NORMAL)
+        profile = str(d.get("power_profile") or "-")
+        pl1 = d.get("pl1_w")
+        pl2 = d.get("pl2_w")
+        rapl = f"{pl1}/{pl2}W" if pl1 is not None and pl2 is not None else "-"
+        self.add(5, 2, f"{profile}  {rapl}", curses.A_DIM)
 
         mode = d.get("mode") or "auto"
         self.add(6, 2, "MODE", curses.A_DIM)
@@ -456,7 +576,7 @@ class Ui:
 
 def usage() -> None:
     print(
-        """omaerofan — raw Gigabyte AERO 17 XB fan + battery control
+        """omaerofan — raw Gigabyte AERO 17 XB fan + battery + RAPL control
 
   omaerofan                 status
   omaerofan json            JSON status (Omarchy plugin)
@@ -468,6 +588,8 @@ def usage() -> None:
   omaerofan battery         show limit
   omaerofan battery off
   omaerofan battery <pct>   20-100
+  omaerofan sync            apply RAPL for the current Omarchy power profile
+  omaerofan rapl <pl1> <pl2>
   omaerofan dump            raw EC bytes
   omaerofan restore         last saved settings
   omaerofan install         privileged EC helper
@@ -531,6 +653,12 @@ def main(argv: list[str]) -> int:
             return 0
         if cmd == "restore":
             return cmd_restore()
+        if cmd in ("sync", "power"):
+            return cmd_sync()
+        if cmd == "rapl" and len(argv) == 3:
+            data = json.loads(run_helper("rapl", str(int(argv[1])), str(int(argv[2]))))
+            print_status(data)
+            return 0
         if cmd == "install":
             return install()
         if cmd in ("-h", "--help", "help"):

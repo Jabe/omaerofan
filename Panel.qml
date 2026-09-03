@@ -42,6 +42,7 @@ Panel {
   readonly property bool dragging: previewCpu >= 0 || previewGpu >= 0 || previewBatt >= 0
     || fanDebounce.running || battDebounce.running
   readonly property bool hot: Model.hottestTemp(status) >= 85
+  readonly property string powerCaption: Model.powerCaption(status)
   readonly property var modeOptions: [
     { id: "auto", label: "Auto" },
     { id: "quiet", label: "Quiet" },
@@ -381,7 +382,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: "The EC helper needs a one-time privileged install (gcc + pkexec). It only allows known fan and charge registers."
+              text: "The EC helper needs a one-time privileged install (gcc + pkexec). It only allows known fan, charge, and RAPL paths."
               wrapMode: Text.WordWrap
               color: root.dim
               font.family: root.bar.fontFamily
@@ -426,6 +427,18 @@ Panel {
             TempCell { label: "MLB"; temp: root.mlbTemp; width: (parent.width - parent.spacing * 2) / 3 }
           }
 
+          Text {
+            visible: root.installed && root.powerCaption !== ""
+            width: parent.width
+            text: root.powerCaption
+            color: root.dim
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 0.8
+            elide: Text.ElideRight
+          }
+
           PanelSeparator {
             visible: root.installed
             foreground: root.bar.foreground
@@ -437,9 +450,18 @@ Panel {
             spacing: Style.space(10)
 
             PanelSectionHeader {
-              text: "MODE"
+              text: "FANS"
               foreground: root.bar.foreground
               fontFamily: root.bar.fontFamily
+            }
+
+            Text {
+              width: parent.width
+              text: "RAPL follows the Omarchy power profile. Fans stay as set."
+              wrapMode: Text.WordWrap
+              color: root.dim
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
             }
 
             Row {

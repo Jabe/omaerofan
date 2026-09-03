@@ -1,8 +1,10 @@
 # Omaerofan
 
-Omarchy bar plugin for raw fan and charge-limit control on the **Gigabyte AERO 17 XB**.
+Omarchy bar plugin for raw fan, RAPL, and charge-limit control on the **Gigabyte AERO 17 XB**.
 
 Talks to the embedded controller through the in-tree `ec_sys` interface. No nbfc, no `ec_probe`.
+
+Fan mode stays independent. **RAPL follows the Omarchy power profile** (`power-saver` / `balanced` / `performance`) so Quiet/Manual 15% is no longer the only way to keep the chassis cool. Leave fans on **Auto** and let the EC curve match the watt budget.
 
 ## Install
 
@@ -41,8 +43,10 @@ omaerofan cpu 25
 omaerofan gpu 40
 omaerofan battery 60
 omaerofan battery off
+omaerofan sync            # RAPL for the current Omarchy power profile
+omaerofan rapl 35 50      # set PL1/PL2 watts once (overwritten on next sync)
 omaerofan dump            # raw EC bytes
-omaerofan restore         # last saved settings
+omaerofan restore         # last saved fan/battery settings + RAPL sync
 ```
 
 TUI keys: `1-4` modes, `j/k` select, `h/l` adjust, `b` battery, `d` dump, `q` quit.
@@ -61,7 +65,19 @@ Verified on firmware FB07 (AERO 17 XB / P77XB):
 
 Manual fan duty is 0–100%. `0` stops the fans. Watch temperatures.
 
-Writing the wrong EC register can brick a laptop. The helper only allows known fan and charge registers.
+## Power profiles
+
+`sync` (also on plugin start, profile change, and after resume) writes Intel RAPL PL1/PL2 from `~/.config/omaerofan/power.json`:
+
+| Omarchy profile | PL1 | PL2 |
+| --- | --- | --- |
+| `power-saver` | 25 W | 35 W |
+| `balanced` | 35 W | 50 W |
+| `performance` | 45 W | 135 W |
+
+That file is created on first sync. Set `"follow_power_profile": false` to stop. Fans are not changed.
+
+Writing the wrong EC register can brick a laptop. The helper only allows known fan and charge registers, plus RAPL sysfs.
 
 ## License
 
