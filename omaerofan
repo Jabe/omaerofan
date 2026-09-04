@@ -32,6 +32,8 @@ DEFAULT_CURVE_POINTS = [
     [88, 70],
     [95, 100],
 ]
+# Same 15-slot grid GCC uses: 0°C floor, then +3°C from 50→89.
+WMI_CURVE_TEMPS = [0] + [50 + 3 * i for i in range(14)]
 MODES = ("auto", "quiet", "gaming", "manual", "curve")
 MODE_LABELS = {
     "auto": "AUTO",
@@ -380,6 +382,9 @@ def enrich(data: dict) -> dict:
     data["curve_min"] = curve["min_pct"]
     data["curve_max"] = curve["max_pct"]
     data["curve_points"] = curve["points"]
+    data["curve_table"] = [
+        [t, s] for t, s in expand_curve_to_wmi(curve["points"], curve["min_pct"], curve["max_pct"])
+    ]
     saved = load_state() or {}
     if saved.get("mode") == "curve" or data.get("mode") == "curve":
         data["mode"] = "curve"
@@ -497,27 +502,41 @@ def cmd_sync(*, quiet: bool = False) -> int:
     return 0
 
 
-def expand_curve_to_wmi(points: list[list[int]], min_pct: int, max_pct: int) -> list[tuple[int, int]]:
-    """15 (temp, speed 0-229) points, monotonic, floor/ceiling applied."""
-    temps = [0]
-    for i in range(13):
-        t = 45 + int(round(i * (92 - 45) / 12))
-        if t not in temps:
-            temps.append(t)
-    if 100 not in temps:
-        temps.append(100)
-    temps = sorted(temps)[:15]
-    while len(temps) < 15:
-        temps.append(temps[-1] if temps else 100)
-    out: list[tuple[int, int]] = []
-    for t in temps:
-        pct = interpolate_curve(t, points, min_pct, max_pct)
-        speed = pct_to_duty(pct)
-        if out:
-            t = max(t, out[-1][0])
-            speed = max(speed, out[-1][1])
-        out.append((t, speed))
+def unique_duties(duties: list[int], floor_d: int, ceil_d: int) -> list[int]:
+    """Rising 0-229 duties so each EC 2s neighbor step can change PWM."""
+    n = len(duties)
+    if n == 0:
+        return []
+    if ceil_d < floor_d:
+        ceil_d = floor_d
+    out = [max(floor_d, min(ceil_d, int(d))) for d in duties]
+    out[0] = floor_d
+    out[-1] = ceil_d
+    for i in range(n - 2, -1, -1):
+        max_here = max(floor_d, ceil_d - (n - 1 - i))
+        if out[i] > max_here:
+            out[i] = max_here
+    out[0] = floor_d
+    for i in range(1, n):
+        if out[i] <= out[i - 1]:
+            candidate = out[i - 1] + 1
+            room = ceil_d - (n - 1 - i)
+            if candidate <= ceil_d and candidate <= room:
+                out[i] = candidate
+            else:
+                out[i] = out[i - 1]
+    out[-1] = ceil_d
     return out
+
+
+def expand_curve_to_wmi(points: list[list[int]], min_pct: int, max_pct: int) -> list[tuple[int, int]]:
+    """15 EC slots: 7-point shape, linearly sampled, then unique duties."""
+    lo = min(min_pct, max_pct)
+    hi = max(min_pct, max_pct)
+    temps = list(WMI_CURVE_TEMPS)
+    raw = [pct_to_duty(interpolate_curve(t, points, lo, hi)) for t in temps]
+    duties = unique_duties(raw, pct_to_duty(lo), pct_to_duty(hi))
+    return list(zip(temps, duties))
 
 
 def pct_to_duty(pct: int) -> int:
@@ -542,16 +561,13 @@ def cmd_apply_curve(*, quiet: bool = False, enable: bool = False) -> int:
         return 0
     cfg = load_curve_config()
     table = expand_curve_to_wmi(cfg["points"], cfg["min_pct"], cfg["max_pct"])
-    try:
-        run_helper("mode", "auto")
-    except RuntimeError:
-        pass
     for i, (temp, speed) in enumerate(table):
         wmi_set(0x68, (speed << 16) | (temp << 8) | i)
-    wmi_set(0x57, 0)
-    wmi_set(0x71, 0)
-    wmi_set(0x6A, 0)
-    wmi_set(0x67, 1)
+    if enable:
+        wmi_set(0x57, 0)
+        wmi_set(0x71, 0)
+        wmi_set(0x6A, 0)
+        wmi_set(0x67, 1)
     data = enrich(status())
     data["mode"] = "curve"
     data["curve_wmi"] = True

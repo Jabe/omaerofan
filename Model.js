@@ -38,6 +38,16 @@ function curveCaption(data, floorOverride, ceilOverride) {
 }
 
 function curvePointsText(data, floorOverride, ceilOverride) {
+  var table = (data && data.curve_table) || []
+  if (table.length) {
+    var bits = []
+    for (var i = 0; i < table.length; i++) {
+      if (!table[i] || table[i].length < 2) continue
+      var pct = Math.round(num(table[i][1], 0) * 100 / 229)
+      bits.push(table[i][0] + "° " + pct + "%")
+    }
+    return bits.join("   ")
+  }
   var floor = floorOverride === undefined || floorOverride < 0
     ? clampCurveMin(data && data.curve_min)
     : clampCurveMin(floorOverride)

@@ -326,14 +326,14 @@ Panel {
 
   Timer {
     id: floorDebounce
-    interval: 180
+    interval: 400
     repeat: false
     onTriggered: root.commitFloor()
   }
 
   Timer {
     id: ceilDebounce
-    interval: 180
+    interval: 400
     repeat: false
     onTriggered: root.commitCeil()
   }
@@ -528,7 +528,7 @@ Panel {
             Text {
               width: parent.width
               text: mode === "curve"
-                ? "15-point table in the EC via WMI. The controller interpolates; RAPL still follows the power profile."
+                ? "15 EC slots (GCC grid). Floor/ceiling reshape the table in place — no Auto hop. RAPL still follows the power profile."
                 : "RAPL follows the Omarchy power profile. Curve uploads a quieter map to the EC."
               wrapMode: Text.WordWrap
               color: root.dim

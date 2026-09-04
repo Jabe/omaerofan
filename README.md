@@ -56,7 +56,9 @@ TUI keys: `1-5` modes, `j/k` select, `h/l` adjust, `b` battery, `d` dump, `q` qu
 
 ## Fan curve
 
-`curve` uploads a 15-point table through ACPI WMI (`WMBD` method `0x68`, packing `(speed << 16) | (temp << 8) | index`), then enables step/custom (`0x67=1`) with fixed/auto/silent off. The EC owns duty after that — no userspace poke of `0xB0`. Floor/ceiling clamp the table. Stock GCC starts around 25%; this one can go to 0. Points live in `~/.config/omaerofan/curve.json`. Live duty is the EC readback at `0xB3`/`0xB4`, not the stale `0xB0` latch.
+`curve` uploads a 15-point table through ACPI WMI (`WMBD` method `0x68`, packing `(speed << 16) | (temp << 8) | index`), then enables step/custom (`0x67=1`) with fixed/auto/silent off. The EC owns duty after that — no userspace poke of `0xB0`.
+
+`curve.json` still holds a 7-point *shape*. That is sampled onto GCC's 15-slot grid (`0°C`, then `50,53,…,89°C`) and duties are made strictly increasing so each EC 2s neighbor step actually changes PWM — no duplicated 12%/45% plateaus. Floor/ceiling only rewrite the 15 `0x68` entries; they do not hop through Auto (stock 25% at 0°C). Live duty is the EC readback at `0xB3`/`0xB4`.
 
 ## Hardware
 
