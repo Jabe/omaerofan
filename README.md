@@ -56,7 +56,7 @@ TUI keys: `1-5` modes, `j/k` select, `h/l` adjust, `b` battery, `d` dump, `q` qu
 
 ## Fan curve
 
-`curve` writes a software duty map (not the EC auto curve). Default floor is 12%, ceiling 40% — it will not go to 100% even under thermal load. Points live in `~/.config/omaerofan/curve.json`. The shell plugin reapplies it every 1.5s and after resume. Dragging the manual sliders leaves curve and goes back to Manual.
+`curve` writes a software duty map (not the EC auto curve). Default floor is 12%, ceiling 40% — it will not go to 100% even under thermal load. Duty moves at most one map neighbor every 2s, same as the EC. Points live in `~/.config/omaerofan/curve.json`. Dragging the manual sliders leaves curve and goes back to Manual.
 
 ## Hardware
 
