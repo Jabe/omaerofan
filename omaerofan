@@ -104,6 +104,10 @@ def clamp_curve_min(pct: int) -> int:
     return max(8, min(40, pct))
 
 
+def clamp_curve_max(pct: int) -> int:
+    return max(25, min(80, pct))
+
+
 def sysfs_cpu_temp() -> int | None:
     root = Path("/sys/class/hwmon")
     if not root.exists():
@@ -170,6 +174,7 @@ def load_power_config() -> dict:
 def default_curve_config() -> dict:
     return {
         "min_pct": 12,
+        "max_pct": 40,
         "hysteresis": 3,
         "points": [list(p) for p in DEFAULT_CURVE_POINTS],
     }
@@ -187,6 +192,10 @@ def load_curve_config() -> dict:
         return cfg
     if isinstance(data.get("min_pct"), (int, float)):
         cfg["min_pct"] = clamp_curve_min(int(data["min_pct"]))
+    if isinstance(data.get("max_pct"), (int, float)):
+        cfg["max_pct"] = clamp_curve_max(int(data["max_pct"]))
+    if cfg["max_pct"] < cfg["min_pct"]:
+        cfg["max_pct"] = cfg["min_pct"]
     if isinstance(data.get("hysteresis"), (int, float)):
         cfg["hysteresis"] = max(0, min(10, int(data["hysteresis"])))
     raw_pts = data.get("points")
@@ -206,8 +215,13 @@ def load_curve_config() -> dict:
 
 def write_curve_config(cfg: dict) -> None:
     CURVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lo = clamp_curve_min(int(cfg.get("min_pct", 12)))
+    hi = clamp_curve_max(int(cfg.get("max_pct", 40)))
+    if hi < lo:
+        hi = lo
     payload = {
-        "min_pct": clamp_curve_min(int(cfg.get("min_pct", 12))),
+        "min_pct": lo,
+        "max_pct": hi,
         "hysteresis": max(0, min(10, int(cfg.get("hysteresis", 3)))),
         "points": cfg.get("points") or [list(p) for p in DEFAULT_CURVE_POINTS],
     }
@@ -220,10 +234,12 @@ def write_default_curve_config() -> None:
     write_curve_config(default_curve_config())
 
 
-def interpolate_curve(temp: int, points: list[list[int]], min_pct: int) -> int:
+def interpolate_curve(temp: int, points: list[list[int]], min_pct: int, max_pct: int) -> int:
+    lo = min(min_pct, max_pct)
+    hi = max(min_pct, max_pct)
     pts = [(int(t), int(p)) for t, p in points]
     if not pts:
-        return min_pct
+        return lo
     if temp <= pts[0][0]:
         pct = pts[0][1]
     elif temp >= pts[-1][0]:
@@ -239,11 +255,7 @@ def interpolate_curve(temp: int, points: list[list[int]], min_pct: int) -> int:
                 else:
                     pct = p0 + (p1 - p0) * (temp - t0) / (t1 - t0)
                 break
-    if temp >= 92:
-        pct = max(pct, 80)
-    if temp >= 96:
-        pct = 100
-    return clamp_fan(max(min_pct, int(round(pct))))
+    return clamp_fan(max(lo, min(hi, int(round(pct)))))
 
 
 def write_default_power_config() -> None:
@@ -355,6 +367,7 @@ def enrich(data: dict) -> dict:
     data["follow_power_profile"] = load_power_config()["follow_power_profile"]
     curve = load_curve_config()
     data["curve_min"] = curve["min_pct"]
+    data["curve_max"] = curve["max_pct"]
     data["curve_points"] = curve["points"]
     saved = load_state() or {}
     if saved.get("mode") == "curve" and data.get("mode") == "manual":
@@ -384,7 +397,7 @@ def print_status(data: dict) -> None:
     print(f"brake      {brake_summary(data)}")
     if data.get("mode") == "curve":
         print(
-            f"curve      {data.get('curve_pct')}% @ {data.get('curve_temp') or data.get('cpu_temp')} C   floor {data.get('curve_min')}%"
+            f"curve      {data.get('curve_pct')}% @ {data.get('curve_temp') or data.get('cpu_temp')} C   {data.get('curve_min')}-{data.get('curve_max')}%"
         )
 
 
@@ -480,18 +493,21 @@ def cmd_apply_curve(*, quiet: bool = False, enable: bool = False) -> int:
         int(data.get("gpu_temp") or 0),
         int(data.get("mlb_temp") or 0),
     )
-    target = interpolate_curve(temp, cfg["points"], cfg["min_pct"])
+    target = interpolate_curve(temp, cfg["points"], cfg["min_pct"], cfg["max_pct"])
     last = int(saved.get("curve_pct") or target)
     last_temp = int(saved.get("curve_temp") or temp)
     hyst = int(cfg.get("hysteresis") or 3)
+    hi = max(cfg["min_pct"], cfg["max_pct"])
     if temp >= 90:
-        pct = 100
+        pct = hi
     elif target >= last:
         pct = target
     elif temp <= last_temp - hyst:
         pct = max(target, last - 2)
     else:
         pct = last
+    lo = cfg["min_pct"]
+    pct = clamp_fan(max(lo, min(hi, pct)))
     data = json.loads(run_helper("fans", str(pct), str(pct)))
     data["mode"] = "curve"
     data["curve_pct"] = pct
@@ -510,6 +526,18 @@ def cmd_curve_min(pct: int) -> int:
     write_default_curve_config()
     cfg = load_curve_config()
     cfg["min_pct"] = clamp_curve_min(pct)
+    write_curve_config(cfg)
+    saved = load_state() or {}
+    if saved.get("mode") == "curve":
+        return cmd_apply_curve()
+    print_status(enrich(status()))
+    return 0
+
+
+def cmd_curve_max(pct: int) -> int:
+    write_default_curve_config()
+    cfg = load_curve_config()
+    cfg["max_pct"] = clamp_curve_max(pct)
     write_curve_config(cfg)
     saved = load_state() or {}
     if saved.get("mode") == "curve":
@@ -816,6 +844,7 @@ def usage() -> None:
   omaerofan auto|quiet|gaming|manual|curve
   omaerofan apply-curve     follow software fan curve (no-op unless curve)
   omaerofan curve-min <pct> curve floor 8-40
+  omaerofan curve-max <pct> curve ceiling 25-80
   omaerofan cpu <pct>       manual CPU fan  (0-100)
   omaerofan gpu <pct>       manual GPU fan
   omaerofan fans <pct> [gpu-pct]
@@ -850,6 +879,8 @@ def main(argv: list[str]) -> int:
             return cmd_apply_curve()
         if cmd == "curve-min" and len(argv) == 2:
             return cmd_curve_min(int(argv[1]))
+        if cmd == "curve-max" and len(argv) == 2:
+            return cmd_curve_max(int(argv[1]))
         if cmd in MODES:
             data = json.loads(run_helper("mode", cmd))
             save_state(data)

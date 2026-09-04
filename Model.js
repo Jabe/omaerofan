@@ -19,25 +19,37 @@ function clampCurveMin(pct) {
   return clamp(Math.round(num(pct, 12)), 8, 40)
 }
 
-function curveCaption(data, floorOverride) {
-  var floor = floorOverride === undefined || floorOverride < 0
-    ? clampCurveMin(data && data.curve_min)
-    : clampCurveMin(floorOverride)
-  var mapped = num(data && data.curve_pct, num(data && data.fan0_pct, 0))
-  var pct = Math.max(floor, mapped)
-  var temp = hottestTemp(data)
-  return pct + "% @ " + temp + "°  ·  floor " + floor + "%"
+function clampCurveMax(pct) {
+  return clamp(Math.round(num(pct, 40)), 25, 80)
 }
 
-function curvePointsText(data, floorOverride) {
+function curveCaption(data, floorOverride, ceilOverride) {
   var floor = floorOverride === undefined || floorOverride < 0
     ? clampCurveMin(data && data.curve_min)
     : clampCurveMin(floorOverride)
+  var ceil = ceilOverride === undefined || ceilOverride < 0
+    ? clampCurveMax(data && data.curve_max)
+    : clampCurveMax(ceilOverride)
+  if (ceil < floor) ceil = floor
+  var mapped = num(data && data.curve_pct, num(data && data.fan0_pct, 0))
+  var pct = Math.max(floor, Math.min(ceil, mapped))
+  var temp = hottestTemp(data)
+  return pct + "% @ " + temp + "°  ·  " + floor + "–" + ceil + "%"
+}
+
+function curvePointsText(data, floorOverride, ceilOverride) {
+  var floor = floorOverride === undefined || floorOverride < 0
+    ? clampCurveMin(data && data.curve_min)
+    : clampCurveMin(floorOverride)
+  var ceil = ceilOverride === undefined || ceilOverride < 0
+    ? clampCurveMax(data && data.curve_max)
+    : clampCurveMax(ceilOverride)
+  if (ceil < floor) ceil = floor
   var pts = (data && data.curve_points) || []
   var bits = []
   for (var i = 0; i < pts.length; i++) {
     if (!pts[i] || pts[i].length < 2) continue
-    var duty = Math.max(floor, num(pts[i][1], 0))
+    var duty = Math.max(floor, Math.min(ceil, num(pts[i][1], 0)))
     bits.push(pts[i][0] + "° " + duty + "%")
   }
   return bits.join("   ")
@@ -177,6 +189,7 @@ if (typeof module !== "undefined") {
     clampFan: clampFan,
     clampBatt: clampBatt,
     clampCurveMin: clampCurveMin,
+    clampCurveMax: clampCurveMax,
     curveCaption: curveCaption,
     curvePointsText: curvePointsText,
     parseStatus: parseStatus,

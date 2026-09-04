@@ -25,6 +25,7 @@ Panel {
   property int previewGpu: -1
   property int previewBatt: -1
   property int previewFloor: -1
+  property int previewCeil: -1
   property string focusSection: "mode"
   property int selectedIndex: 0
   property bool cursorActive: false
@@ -41,8 +42,9 @@ Panel {
   readonly property bool batteryOn: status.battery_on === true || status.battery_on === 1
   readonly property int batteryLimit: previewBatt >= 0 ? previewBatt : Model.clampBatt(status.battery_limit)
   readonly property int curveFloor: previewFloor >= 0 ? previewFloor : Model.clampCurveMin(status.curve_min)
+  readonly property int curveCeil: previewCeil >= 0 ? previewCeil : Model.clampCurveMax(status.curve_max)
   readonly property int curvePct: Model.num(status.curve_pct, cpuFan)
-  readonly property bool dragging: fanDebounce.running || battDebounce.running || floorDebounce.running
+  readonly property bool dragging: fanDebounce.running || battDebounce.running || floorDebounce.running || ceilDebounce.running
   readonly property bool hot: Model.hottestTemp(status) >= 85
   readonly property string powerCaption: Model.powerCaption(status)
   readonly property string brakeCaption: Model.brakeCaption(status)
@@ -56,7 +58,7 @@ Panel {
   ]
   readonly property var visibleSections: {
     if (!installed) return ["install"]
-    if (mode === "curve") return ["mode", "floor", "battery"]
+    if (mode === "curve") return ["mode", "floor", "ceil", "battery"]
     return ["mode", "cpu", "gpu", "battery"]
   }
   readonly property color dim: Qt.darker(barForeground, 1.4)
@@ -80,6 +82,10 @@ Panel {
     if (!floorDebounce.running) {
       if (previewFloor < 0 || Model.clampCurveMin(parsed.curve_min) === previewFloor)
         previewFloor = -1
+    }
+    if (!ceilDebounce.running) {
+      if (previewCeil < 0 || Model.clampCurveMax(parsed.curve_max) === previewCeil)
+        previewCeil = -1
     }
   }
 
@@ -158,6 +164,16 @@ Panel {
     runCli(["curve-min", String(Model.clampCurveMin(curveFloor))])
   }
 
+  function previewCeilValue(value) {
+    previewCeil = Model.clampCurveMax(value)
+    ceilDebounce.restart()
+  }
+
+  function commitCeil() {
+    ceilDebounce.stop()
+    runCli(["curve-max", String(Model.clampCurveMax(curveCeil))])
+  }
+
   function installHelper() {
     if (installProc.running) return
     lastError = ""
@@ -208,6 +224,7 @@ Panel {
     if (focusSection === "cpu") nudgeFan("cpu", delta * 5)
     else if (focusSection === "gpu") nudgeFan("gpu", delta * 5)
     else if (focusSection === "floor") previewFloorValue(curveFloor + delta * 1)
+    else if (focusSection === "ceil") previewCeilValue(curveCeil + delta * 1)
     else if (focusSection === "battery") {
       if (!batteryOn) setBattery(true, batteryLimit)
       else previewBattery(batteryLimit + delta * 5)
@@ -312,6 +329,13 @@ Panel {
     interval: 180
     repeat: false
     onTriggered: root.commitFloor()
+  }
+
+  Timer {
+    id: ceilDebounce
+    interval: 180
+    repeat: false
+    onTriggered: root.commitCeil()
   }
 
   BarIconButton {
@@ -549,7 +573,7 @@ Panel {
           Text {
             visible: root.installed && root.mode === "curve"
             width: parent.width
-            text: Model.curveCaption(root.status, root.curveFloor)
+            text: Model.curveCaption(root.status, root.curveFloor, root.curveCeil)
             color: root.bar.foreground
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -559,7 +583,7 @@ Panel {
           Text {
             visible: root.installed && root.mode === "curve"
             width: parent.width
-            text: Model.curvePointsText(root.status, root.curveFloor)
+            text: Model.curvePointsText(root.status, root.curveFloor, root.curveCeil)
             wrapMode: Text.WordWrap
             color: root.dim
             font.family: root.bar.fontFamily
@@ -600,69 +624,33 @@ Panel {
             onCommit: root.commitFans()
           }
 
-          Column {
+          BoundSlider {
             visible: root.installed && root.mode === "curve"
             width: parent.width
-            spacing: Style.space(6)
-
-            Item {
-              width: parent.width
-              implicitHeight: Math.max(floorHeader.implicitHeight, floorValue.implicitHeight)
-
-              PanelSectionHeader {
-                id: floorHeader
-                text: "FLOOR"
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-              }
-
-              Text {
-                id: floorValue
-                text: root.curveFloor + "%"
-                color: root.dim
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-              }
+            title: "FLOOR"
+            section: "floor"
+            value: root.curveFloor
+            minimum: 8
+            maximum: 40
+            onPreview: function(v) { root.previewFloorValue(v) }
+            onCommit: function(v) {
+              root.previewFloor = Model.clampCurveMin(v)
+              root.commitFloor()
             }
+          }
 
-            CursorSurface {
-              width: parent.width
-              height: floorSlider.implicitHeight + Style.spacing.controlGap
-              hasCursor: root.cursorActive && root.focusSection === "floor"
-              foreground: root.bar.foreground
-              outline: true
-
-              PanelSlider {
-                id: floorSlider
-                bar: root.bar
-                anchors.fill: parent
-                anchors.leftMargin: Style.space(6)
-                anchors.rightMargin: Style.space(6)
-                minimum: 8
-                maximum: 40
-                step: 1
-                integer: true
-                value: root.curveFloor
-                onMoved: function(v) { root.previewFloorValue(v) }
-                onReleased: function(v) {
-                  root.previewFloor = Model.clampCurveMin(v)
-                  root.commitFloor()
-                }
-              }
-
-              HoverHandler {
-                onHoveredChanged: if (hovered) {
-                  root.cursorActive = true
-                  root.focusSection = "floor"
-                  root.selectedIndex = -1
-                }
-              }
+          BoundSlider {
+            visible: root.installed && root.mode === "curve"
+            width: parent.width
+            title: "CEILING"
+            section: "ceil"
+            value: root.curveCeil
+            minimum: 25
+            maximum: 80
+            onPreview: function(v) { root.previewCeilValue(v) }
+            onCommit: function(v) {
+              root.previewCeil = Model.clampCurveMax(v)
+              root.commitCeil()
             }
           }
 
@@ -830,6 +818,76 @@ Panel {
         onHoveredChanged: if (hovered) {
           root.cursorActive = true
           root.focusSection = section
+          root.selectedIndex = -1
+        }
+      }
+    }
+  }
+
+  component BoundSlider: Column {
+    id: boundRoot
+    property string title: ""
+    property string section: ""
+    property int value: 0
+    property int minimum: 0
+    property int maximum: 100
+    signal preview(real value)
+    signal commit(real value)
+
+    spacing: Style.space(6)
+
+    Item {
+      width: parent.width
+      implicitHeight: Math.max(header.implicitHeight, pctLabel.implicitHeight)
+
+      PanelSectionHeader {
+        id: header
+        text: boundRoot.title
+        foreground: root.bar.foreground
+        fontFamily: root.bar.fontFamily
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      Text {
+        id: pctLabel
+        text: boundRoot.value + "%"
+        color: root.dim
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+        anchors.right: parent.right
+        anchors.rightMargin: Style.space(6)
+        anchors.verticalCenter: parent.verticalCenter
+      }
+    }
+
+    CursorSurface {
+      width: parent.width
+      height: sliderItem.implicitHeight + Style.spacing.controlGap
+      hasCursor: root.cursorActive && root.focusSection === boundRoot.section
+      foreground: root.bar.foreground
+      outline: true
+
+      PanelSlider {
+        id: sliderItem
+        bar: root.bar
+        anchors.fill: parent
+        anchors.leftMargin: Style.space(6)
+        anchors.rightMargin: Style.space(6)
+        minimum: boundRoot.minimum
+        maximum: boundRoot.maximum
+        step: 1
+        integer: true
+        value: boundRoot.value
+        onMoved: function(v) { boundRoot.preview(v) }
+        onReleased: function(v) { boundRoot.preview(v); boundRoot.commit(v) }
+      }
+
+      HoverHandler {
+        onHoveredChanged: if (hovered) {
+          root.cursorActive = true
+          root.focusSection = boundRoot.section
           root.selectedIndex = -1
         }
       }
