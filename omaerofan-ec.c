@@ -29,6 +29,8 @@
 #define REG_CHARGE_PCT 0xA9
 #define REG_FAN0 0xB0
 #define REG_FAN1 0xB1
+#define REG_FAN0_LIVE 0xB3
+#define REG_FAN1_LIVE 0xB4
 #define REG_FAN0_RPM 0xFC
 #define REG_FAN1_RPM 0xFE
 
@@ -250,12 +252,24 @@ static uint16_t read16be(uint8_t addr) {
   return ((uint16_t)must_read(addr) << 8) | must_read((uint8_t)(addr + 1));
 }
 
+static uint8_t live_duty(uint8_t cmd_reg, uint8_t live_reg) {
+  /* Fixed/manual latches the target in B0/B1. Auto and the WMI curve
+     interpolate into B3/B4 and leave B0 stale. */
+  if (bit_get(REG_FIXED, BIT_FIXED))
+    return must_read(cmd_reg);
+  return must_read(live_reg);
+}
+
 static const char *detect_mode(void) {
   if (bit_get(REG_QUIET, BIT_QUIET))
     return "quiet";
   if (bit_get(REG_GAMING, BIT_GAMING))
     return "gaming";
-  if (bit_get(REG_CUSTOM, BIT_CUSTOM) || bit_get(REG_FIXED, BIT_FIXED))
+  if (bit_get(REG_FIXED, BIT_FIXED))
+    return "manual";
+  if (bit_get(REG_CUSTOM, BIT_DEEP))
+    return "curve";
+  if (bit_get(REG_CUSTOM, BIT_CUSTOM))
     return "manual";
   return "auto";
 }
@@ -492,8 +506,8 @@ static void apply_battery(int on, int pct) {
 }
 
 static void print_status(void) {
-  uint8_t fan0 = must_read(REG_FAN0);
-  uint8_t fan1 = must_read(REG_FAN1);
+  uint8_t fan0 = live_duty(REG_FAN0, REG_FAN0_LIVE);
+  uint8_t fan1 = live_duty(REG_FAN1, REG_FAN1_LIVE);
   uint8_t charge = must_read(REG_CHARGE);
   int batt_on = (charge >> BIT_CHARGE) & 1;
   printf("{\n");
@@ -536,6 +550,55 @@ static void print_dump(void) {
   }
 }
 
+static int acpi_call(const char *cmd, char *out, size_t outsz) {
+  if (access("/proc/acpi/call", F_OK) != 0)
+    system("modprobe acpi_call >/dev/null 2>&1");
+  FILE *f = fopen("/proc/acpi/call", "w");
+  if (!f)
+    return -1;
+  if (fputs(cmd, f) < 0) {
+    fclose(f);
+    return -1;
+  }
+  fclose(f);
+  f = fopen("/proc/acpi/call", "r");
+  if (!f)
+    return -1;
+  size_t n = fread(out, 1, outsz - 1, f);
+  fclose(f);
+  while (n > 0 && (out[n - 1] == '\0' || out[n - 1] == '\n'))
+    n--;
+  out[n] = '\0';
+  if (n >= 5 && strncmp(out, "Error", 5) == 0)
+    return -1;
+  return 0;
+}
+
+static unsigned long parse_u32(const char *s) {
+  char *end = NULL;
+  unsigned long v = strtoul(s, &end, 0);
+  if (!s[0] || !end || *end || v > 0xFFFFFFFFul)
+    die("number must be 32-bit");
+  return v;
+}
+
+static void wmi_get(unsigned method, unsigned arg) {
+  char cmd[128];
+  char out[128];
+  snprintf(cmd, sizeof(cmd), "\\_SB_.PCI0.AMW0.WMBC 0 0x%x 0x%x", method, arg);
+  if (acpi_call(cmd, out, sizeof(out)) < 0)
+    die_errno("WMI get failed");
+  printf("%s\n", out);
+}
+
+static void wmi_set(unsigned method, unsigned arg) {
+  char cmd[128];
+  char out[128];
+  snprintf(cmd, sizeof(cmd), "\\_SB_.PCI0.AMW0.WMBD 0 0x%x 0x%x", method, arg);
+  if (acpi_call(cmd, out, sizeof(out)) < 0)
+    die_errno("WMI set failed");
+}
+
 static void usage(void) {
   fprintf(stderr,
           "usage: omaerofan-ec status\n"
@@ -545,6 +608,8 @@ static void usage(void) {
           "       omaerofan-ec battery off\n"
           "       omaerofan-ec battery <pct>\n"
           "       omaerofan-ec rapl [<pl1-w> <pl2-w>]\n"
+          "       omaerofan-ec wmi-get <method> [arg]\n"
+          "       omaerofan-ec wmi-set <method> <arg>\n"
           "       omaerofan-ec write <reg> <val>\n");
   exit(2);
 }
@@ -586,6 +651,12 @@ int main(int argc, char **argv) {
   } else if (strcmp(argv[1], "rapl") == 0 && argc == 4) {
     apply_rapl(atoi(argv[2]), atoi(argv[3]));
     print_status();
+  } else if (strcmp(argv[1], "wmi-get") == 0 && (argc == 3 || argc == 4)) {
+    unsigned method = (unsigned)parse_u32(argv[2]);
+    unsigned arg = argc == 4 ? (unsigned)parse_u32(argv[3]) : 0;
+    wmi_get(method, arg);
+  } else if (strcmp(argv[1], "wmi-set") == 0 && argc == 4) {
+    wmi_set((unsigned)parse_u32(argv[2]), (unsigned)parse_u32(argv[3]));
   } else if (strcmp(argv[1], "write") == 0 && argc == 4) {
     uint8_t reg = (uint8_t)parse_num(argv[2]);
     uint8_t val = (uint8_t)parse_num(argv[3]);

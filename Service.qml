@@ -45,12 +45,6 @@ Item {
     syncProc.running = true
   }
 
-  function runCurve() {
-    if (curveProc.running || restoreProc.running) return
-    curveProc.command = [root.cli, "apply-curve"]
-    curveProc.running = true
-  }
-
   Component.onCompleted: {
     root.scheduleRestore()
     root.scheduleSync()
@@ -110,16 +104,6 @@ Item {
     repeat: true
     onTriggered: root.scheduleSync()
   }
-
-  Timer {
-    interval: 2000
-    running: true
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: root.runCurve()
-  }
-
-  Process { id: curveProc }
 
   Process {
     id: restoreProc

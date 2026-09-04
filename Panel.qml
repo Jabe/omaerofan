@@ -528,8 +528,8 @@ Panel {
             Text {
               width: parent.width
               text: mode === "curve"
-                ? "Software curve on manual duty. RAPL still follows the power profile."
-                : "RAPL follows the Omarchy power profile. Curve replaces the loud EC auto map."
+                ? "15-point table in the EC via WMI. The controller interpolates; RAPL still follows the power profile."
+                : "RAPL follows the Omarchy power profile. Curve uploads a quieter map to the EC."
               wrapMode: Text.WordWrap
               color: root.dim
               font.family: root.bar.fontFamily

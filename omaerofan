@@ -46,6 +46,17 @@ def helper_cmd(*args: str) -> list[str]:
     return ["sudo", "-n", str(HELPER), *args]
 
 
+def wmi_get(method: int, arg: int = 0) -> int:
+    out = run_helper("wmi-get", hex(method), hex(arg)).strip()
+    if out.startswith("Error"):
+        raise RuntimeError(out)
+    return int(out, 16)
+
+
+def wmi_set(method: int, arg: int) -> None:
+    run_helper("wmi-set", hex(method), hex(arg))
+
+
 def run_helper(*args: str) -> str:
     if not HELPER.exists():
         raise RuntimeError("helper missing — run: omaerofan install")
@@ -76,10 +87,6 @@ def save_state(data: dict) -> None:
     if payload["mode"] == "curve":
         payload["curve_pct"] = data.get("curve_pct")
         payload["curve_temp"] = data.get("curve_temp")
-        if data.get("curve_step_at") is not None:
-            payload["curve_step_at"] = data.get("curve_step_at")
-        elif prev.get("curve_step_at") is not None:
-            payload["curve_step_at"] = prev.get("curve_step_at")
     STATE_PATH.write_text(json.dumps(payload, indent=2) + "\n")
 
 
@@ -238,36 +245,6 @@ def write_default_curve_config() -> None:
     write_curve_config(default_curve_config())
 
 
-def effective_curve_duties(points: list[list[int]], min_pct: int, max_pct: int) -> list[int]:
-    lo = min(min_pct, max_pct)
-    hi = max(min_pct, max_pct)
-    duties: list[int] = []
-    for _, p in sorted(points, key=lambda x: x[0]):
-        d = clamp_fan(max(lo, min(hi, int(p))))
-        if d not in duties:
-            duties.append(d)
-    if lo not in duties:
-        duties.append(lo)
-    if hi not in duties:
-        duties.append(hi)
-    duties.sort()
-    return duties
-
-
-def step_toward_neighbor(current: int, target: int, duties: list[int]) -> int:
-    if current == target:
-        return current
-    if target > current:
-        for duty in duties:
-            if duty > current:
-                return min(duty, target)
-        return target
-    for duty in reversed(duties):
-        if duty < current:
-            return max(duty, target)
-    return target
-
-
 def interpolate_curve(temp: int, points: list[list[int]], min_pct: int, max_pct: int) -> int:
     lo = min(min_pct, max_pct)
     hi = max(min_pct, max_pct)
@@ -404,10 +381,15 @@ def enrich(data: dict) -> dict:
     data["curve_max"] = curve["max_pct"]
     data["curve_points"] = curve["points"]
     saved = load_state() or {}
-    if saved.get("mode") == "curve" and data.get("mode") == "manual":
+    if saved.get("mode") == "curve" or data.get("mode") == "curve":
         data["mode"] = "curve"
-        data["curve_pct"] = saved.get("curve_pct", data.get("fan0_pct"))
-        data["curve_temp"] = saved.get("curve_temp")
+        data["curve_pct"] = data.get("fan0_pct")
+        data["curve_temp"] = max(
+            int(data.get("cpu_temp") or 0),
+            int(data.get("gpu_temp") or 0),
+            int(data.get("mlb_temp") or 0),
+        )
+        data["curve_wmi"] = True
     return data
 
 
@@ -515,52 +497,71 @@ def cmd_sync(*, quiet: bool = False) -> int:
     return 0
 
 
+def expand_curve_to_wmi(points: list[list[int]], min_pct: int, max_pct: int) -> list[tuple[int, int]]:
+    """15 (temp, speed 0-229) points, monotonic, floor/ceiling applied."""
+    temps = [0]
+    for i in range(13):
+        t = 45 + int(round(i * (92 - 45) / 12))
+        if t not in temps:
+            temps.append(t)
+    if 100 not in temps:
+        temps.append(100)
+    temps = sorted(temps)[:15]
+    while len(temps) < 15:
+        temps.append(temps[-1] if temps else 100)
+    out: list[tuple[int, int]] = []
+    for t in temps:
+        pct = interpolate_curve(t, points, min_pct, max_pct)
+        speed = pct_to_duty(pct)
+        if out:
+            t = max(t, out[-1][0])
+            speed = max(speed, out[-1][1])
+        out.append((t, speed))
+    return out
+
+
+def pct_to_duty(pct: int) -> int:
+    pct = clamp_fan(pct)
+    if pct <= 0:
+        return 0
+    return (pct * 229 + 50) // 100
+
+
+def wmi_disable_custom() -> None:
+    try:
+        wmi_set(0x67, 0)
+        wmi_set(0x6A, 0)
+    except RuntimeError:
+        pass
+
+
 def cmd_apply_curve(*, quiet: bool = False, enable: bool = False) -> int:
     write_default_curve_config()
     saved = load_state() or {}
     if not enable and saved.get("mode") != "curve":
         return 0
     cfg = load_curve_config()
+    table = expand_curve_to_wmi(cfg["points"], cfg["min_pct"], cfg["max_pct"])
+    try:
+        run_helper("mode", "auto")
+    except RuntimeError:
+        pass
+    for i, (temp, speed) in enumerate(table):
+        wmi_set(0x68, (speed << 16) | (temp << 8) | i)
+    wmi_set(0x57, 0)
+    wmi_set(0x71, 0)
+    wmi_set(0x6A, 0)
+    wmi_set(0x67, 1)
     data = enrich(status())
-    temp = max(
-        int(data.get("cpu_temp") or 0),
-        int(data.get("gpu_temp") or 0),
-        int(data.get("mlb_temp") or 0),
-    )
-    lo = cfg["min_pct"]
-    hi = max(cfg["min_pct"], cfg["max_pct"])
-    target = interpolate_curve(temp, cfg["points"], lo, hi)
-    if temp >= 90:
-        target = hi
-    last = int(saved.get("curve_pct") if saved.get("mode") == "curve" else (data.get("fan0_pct") or target))
-    last_temp = int(saved.get("curve_temp") or temp)
-    hyst = int(cfg.get("hysteresis") or 3)
-    if target < last and temp > last_temp - hyst:
-        target = last
-    duties = effective_curve_duties(cfg["points"], lo, hi)
-    pct = step_toward_neighbor(last, target, duties)
-    pct = clamp_fan(max(lo, min(hi, pct)))
-    now = time.time()
-    if pct == last:
-        data["mode"] = "curve"
-        data["curve_pct"] = pct
-        data["curve_temp"] = temp
-        save_state(data)
-        if not quiet:
-            print_status(data)
-        return 0
-    if not enable:
-        prev = float(saved.get("curve_step_at") or 0)
-        if now - prev < 1.9:
-            return 0
-    data = json.loads(run_helper("fans", str(pct), str(pct)))
     data["mode"] = "curve"
-    data["curve_pct"] = pct
-    data["curve_temp"] = temp
-    data["curve_step_at"] = now
+    data["curve_wmi"] = True
+    data["curve_table"] = [[t, s] for t, s in table]
     save_state(data)
     if not quiet:
         print_status(data)
+        print("wmi table:")
+        for i, (temp, speed) in enumerate(table):
+            print(f"  {i:2d}  {temp:3d}C  {speed:3d}  {speed * 100 / 229:.0f}%")
     return 0
 
 
@@ -639,8 +640,6 @@ class Ui:
 
     def refresh(self) -> None:
         try:
-            if (load_state() or {}).get("mode") == "curve":
-                cmd_apply_curve(quiet=True)
             self.data = enrich(status())
             self.err = ""
         except Exception as exc:  # noqa: BLE001
@@ -663,6 +662,10 @@ class Ui:
             except Exception as exc:  # noqa: BLE001
                 self.err = str(exc)
             return
+        try:
+            wmi_disable_custom()
+        except RuntimeError:
+            pass
         self.apply("mode", mode)
 
     def nudge_fan(self, which: str, delta: int) -> None:
@@ -672,6 +675,10 @@ class Ui:
             cpu = step_fan(cpu, delta)
         else:
             gpu = step_fan(gpu, delta)
+        try:
+            wmi_disable_custom()
+        except RuntimeError:
+            pass
         self.apply("fans", str(cpu), str(gpu))
 
     def nudge_batt(self, delta: int) -> None:
@@ -888,7 +895,7 @@ def usage() -> None:
   omaerofan json            JSON status (Omarchy plugin)
   omaerofan ui              TUI
   omaerofan auto|quiet|gaming|manual|curve
-  omaerofan apply-curve     follow software fan curve (no-op unless curve)
+  omaerofan apply-curve     upload 15-point WMI table (no-op unless curve)
   omaerofan curve-min <pct> curve floor 8-40
   omaerofan curve-max <pct> curve ceiling 25-80
   omaerofan cpu <pct>       manual CPU fan  (0-100)
@@ -928,6 +935,8 @@ def main(argv: list[str]) -> int:
         if cmd == "curve-max" and len(argv) == 2:
             return cmd_curve_max(int(argv[1]))
         if cmd in MODES:
+            if cmd != "curve":
+                wmi_disable_custom()
             data = json.loads(run_helper("mode", cmd))
             save_state(data)
             print_status(data)
@@ -945,6 +954,7 @@ def main(argv: list[str]) -> int:
             print_status(data)
             return 0
         if cmd == "fans" and len(argv) in (2, 3):
+            wmi_disable_custom()
             cpu = clamp_fan(int(argv[1]))
             gpu = clamp_fan(int(argv[2])) if len(argv) == 3 else cpu
             data = json.loads(run_helper("fans", str(cpu), str(gpu)))

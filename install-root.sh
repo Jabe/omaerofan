@@ -25,6 +25,7 @@ EOF
 cat >/etc/modules-load.d/omaerofan.conf <<'EOF'
 ec_sys
 msr
+acpi_call
 EOF
 
 # drop the previous omafan name
@@ -33,4 +34,5 @@ rm -f /usr/local/libexec/omafan-ec /usr/local/bin/omafan \
 
 modprobe ec_sys write_support=1 || true
 modprobe msr || true
+modprobe acpi_call || true
 echo "omaerofan helper installed"

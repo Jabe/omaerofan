@@ -4,7 +4,7 @@ Omarchy bar plugin for raw fan, RAPL, and charge-limit control on the **Gigabyte
 
 Talks to the embedded controller through the in-tree `ec_sys` interface. No nbfc, no `ec_probe`.
 
-Fan mode stays independent. **RAPL follows the Omarchy power profile**. EC Auto floors around 30% / 2900 RPM — use **Curve** for a quieter software map on manual duty.
+Fan mode stays independent. **RAPL follows the Omarchy power profile**. EC Auto floors around 30% / 2900 RPM — **Curve** writes a 15-point table into the EC over WMI (same path as Gigabyte Control Center / [alfc](https://github.com/s-h-a-d-o-w/alfc)), and the controller interpolates on its own 2s tick.
 
 ## Install
 
@@ -56,7 +56,7 @@ TUI keys: `1-5` modes, `j/k` select, `h/l` adjust, `b` battery, `d` dump, `q` qu
 
 ## Fan curve
 
-`curve` writes a software duty map (not the EC auto curve). Default floor is 12%, ceiling 40% — it will not go to 100% even under thermal load. Duty moves at most one map neighbor every 2s, same as the EC. Points live in `~/.config/omaerofan/curve.json`. Dragging the manual sliders leaves curve and goes back to Manual.
+`curve` uploads a 15-point table through ACPI WMI (`WMBD` method `0x68`, packing `(speed << 16) | (temp << 8) | index`), then enables step/custom (`0x67=1`) with fixed/auto/silent off. The EC owns duty after that — no userspace poke of `0xB0`. Floor/ceiling clamp the table. Stock GCC starts around 25%; this one can go to 0. Points live in `~/.config/omaerofan/curve.json`. Live duty is the EC readback at `0xB3`/`0xB4`, not the stale `0xB0` latch.
 
 ## Hardware
 
